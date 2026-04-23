@@ -1724,6 +1724,7 @@ export fn cpu_get_eflags(s: *CpuState) u32 { return s.eflags; }
 export fn cpu_set_eflags(s: *CpuState, val: u32) void { s.eflags = val; }
 export fn cpu_is_halted(s: *CpuState) bool { return s.halted; }
 export fn cpu_is_faulted(s: *CpuState) bool { return s.faulted; }
+export fn cpu_set_halted(s: *CpuState) void { s.halted = true; }
 export fn cpu_clear_halted(s: *CpuState) void { s.halted = false; s.faulted = false; }
 export fn cpu_get_step_count(s: *CpuState) u64 { return s.step_count; }
 export fn cpu_get_last_opcode(s: *CpuState) u8 { return s.last_opcode; }
