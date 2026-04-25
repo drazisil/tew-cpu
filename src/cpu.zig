@@ -160,6 +160,15 @@ fn updateFlagsLogic(s: *CpuState, result: u32) void {
     p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
 }
+fn updateFlagsLogic8(s: *CpuState, result: u8) void {
+    setFlag(s, ZF_BIT, result == 0);
+    setFlag(s, SF_BIT, (result & 0x80) != 0);
+    setFlag(s, CF_BIT, false);
+    setFlag(s, OF_BIT, false);
+    var p: u8 = result;
+    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+    setFlag(s, PF_BIT, (p & 1) == 0);
+}
 
 // ─── 8-bit register helpers ──────────────────────────────────────────────────
 inline fn readReg8(s: *CpuState, idx: u8) u8 {
@@ -474,6 +483,69 @@ fn doGroup2(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u32, count: 
     }
 }
 
+fn doGroup2_8(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u8, count: u8) void {
+    if (count == 0) { writeRm8Resolved(s, is_reg, addr, val); return; }
+    switch (op_ext) {
+        0 => { // ROL r/m8, count
+            const c8: u3 = @truncate(count & 7);
+            const r: u8 = if (c8 == 0) val else (val << c8) | (val >> @as(u3, @truncate(8 - @as(u8, c8))));
+            writeRm8Resolved(s, is_reg, addr, r);
+            setFlag(s, CF_BIT, (r & 1) != 0);
+            if ((count & 0x1F) == 1) setFlag(s, OF_BIT, ((r & 0x80) != 0) != ((r & 1) != 0));
+        },
+        1 => { // ROR r/m8, count
+            const c8: u3 = @truncate(count & 7);
+            const r: u8 = if (c8 == 0) val else (val >> c8) | (val << @as(u3, @truncate(8 - @as(u8, c8))));
+            writeRm8Resolved(s, is_reg, addr, r);
+            setFlag(s, CF_BIT, (r & 0x80) != 0);
+            if ((count & 0x1F) == 1) setFlag(s, OF_BIT, ((r & 0x80) != 0) != ((r & 0x40) != 0));
+        },
+        2 => { // RCL r/m8 — 9-bit rotation through CF
+            const c9: u8 = count % 9;
+            var temp: u8 = val; var cf = getFlag(s, CF_BIT);
+            var i: u8 = 0;
+            while (i < c9) : (i += 1) {
+                const out = (temp & 0x80) != 0;
+                temp = (temp << 1) | @as(u8, if (cf) 1 else 0);
+                cf = out;
+            }
+            writeRm8Resolved(s, is_reg, addr, temp); setFlag(s, CF_BIT, cf);
+        },
+        3 => { // RCR r/m8 — 9-bit rotation through CF
+            const c9: u8 = count % 9;
+            var temp: u8 = val; var cf = getFlag(s, CF_BIT);
+            var i: u8 = 0;
+            while (i < c9) : (i += 1) {
+                const out = (temp & 1) != 0;
+                temp = (temp >> 1) | (@as(u8, if (cf) 1 else 0) << 7);
+                cf = out;
+            }
+            writeRm8Resolved(s, is_reg, addr, temp); setFlag(s, CF_BIT, cf);
+        },
+        4, 6 => { // SHL/SAL r/m8
+            const r: u8 = if (count >= 8) 0 else val << @as(u3, @truncate(count));
+            writeRm8Resolved(s, is_reg, addr, r);
+            updateFlagsLogic8(s, r);
+        },
+        5 => { // SHR r/m8
+            const r: u8 = if (count >= 8) 0 else val >> @as(u3, @truncate(count));
+            const new_cf: bool = if (count <= 8) ((val >> @as(u3, @truncate(count - 1))) & 1) != 0 else false;
+            writeRm8Resolved(s, is_reg, addr, r);
+            updateFlagsLogic8(s, r); setFlag(s, CF_BIT, new_cf);
+        },
+        7 => { // SAR r/m8
+            const effective: u3 = if (count > 7) @as(u3, 7) else @truncate(count);
+            const sval: i8 = @bitCast(val);
+            const r: u8 = @bitCast(sval >> effective);
+            const shifted_out: u3 = if (count > 8) @as(u3, 7) else @truncate(count - 1);
+            const new_cf = ((val >> shifted_out) & 1) != 0;
+            writeRm8Resolved(s, is_reg, addr, r);
+            updateFlagsLogic8(s, r); setFlag(s, CF_BIT, new_cf);
+        },
+        else => { s.faulted = true; s.halted = true; },
+    }
+}
+
 // ─── Arithmetic opcodes ───────────────────────────────────────────────────────
 fn op00(s: *CpuState) void { // ADD rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
@@ -718,9 +790,17 @@ fn opC8(s: *CpuState) void { // ENTER
 fn opC9(s: *CpuState) void { // LEAVE
     s.regs[ESP] = s.regs[EBP]; s.regs[EBP] = pop32(s);
 }
+fn opC0(s: *CpuState) void { // Group 2: shift rm8, imm8
+    const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
+    doGroup2_8(s, res.is_reg, res.addr, d.reg, res.value, fetch8(s) & 0x1F);
+}
 fn opD1(s: *CpuState) void { // Group 2: shift rmv, 1
     const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
     doGroup2(s, res.is_reg, res.addr, d.reg, res.value, 1);
+}
+fn opD2(s: *CpuState) void { // Group 2: shift rm8, CL
+    const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
+    doGroup2_8(s, res.is_reg, res.addr, d.reg, res.value, @truncate(s.regs[ECX] & 0x1F));
 }
 fn opD3(s: *CpuState) void { // Group 2: shift rmv, CL
     const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
@@ -1668,9 +1748,9 @@ const dispatch_table: [256]OpFn = dt: {
     t[0xA4] = opA4; t[0xA5] = opA5; t[0xA6] = opA6; t[0xA7] = opA7;
     t[0xA8] = opA8; t[0xA9] = opA9;
     t[0xAA] = opAA; t[0xAB] = opAB; t[0xAC] = opAC; t[0xAD] = opAD; t[0xAE] = opAE; t[0xAF] = opAF;
-    t[0xC1] = opC1; t[0xC2] = opC2; t[0xC3] = opC3; t[0xC4] = opC4; t[0xC5] = opC5;
+    t[0xC0] = opC0; t[0xC1] = opC1; t[0xC2] = opC2; t[0xC3] = opC3; t[0xC4] = opC4; t[0xC5] = opC5;
     t[0xC6] = opC6; t[0xC7] = opC7; t[0xC8] = opC8; t[0xC9] = opC9; t[0xCC] = opCC; t[0xCD] = opCD;
-    t[0xD1] = opD1; t[0xD3] = opD3;
+    t[0xD1] = opD1; t[0xD2] = opD2; t[0xD3] = opD3;
     t[0xD8] = opD8; t[0xD9] = opD9; t[0xDA] = opDA; t[0xDB] = opDB;
     t[0xDC] = opDC; t[0xDD] = opDD; t[0xDE] = opDE; t[0xDF] = opDF;
     t[0xE0] = opE0; t[0xE1] = opE1; t[0xE2] = opE2; t[0xE3] = opE3;
