@@ -1468,6 +1468,13 @@ fn op0F(s: *CpuState) void {
                 else => {},
             }
         },
+        0x34 => { // SYSENTER — fast NT syscall gate (EAX=syscall#, EDX=arg stack)
+            if (s.int_handler) |h| h(s, 0x2E);
+        },
+        0x35 => { // SYSEXIT — fast return from kernel; EIP←ECX, ESP←EDX
+            s.eip = s.regs[ECX];
+            s.regs[ESP] = s.regs[EDX];
+        },
         0xA2 => { // CPUID
             const leaf = s.regs[EAX];
             switch (leaf) {
