@@ -60,6 +60,10 @@ pub const CpuState = struct {
     seg_override: u8 = SEG_NONE,
     rep_prefix: u8 = REP_NONE,
     op_size_ovr: bool = false,
+    watchpoint: u32 = 0,         // address to watch (0 = disabled)
+    watchpoint_eip: u32 = 0,     // EIP when watchpoint fired
+    watchpoint_val: u32 = 0,     // value written to watchpoint address
+    watchpoint_hit: bool = false,
 };
 
 // ─── Internal helper structs ─────────────────────────────────────────────────
@@ -83,6 +87,13 @@ inline fn memRead32(s: *CpuState, addr: u32) u32 {
 inline fn memReadS32(s: *CpuState, addr: u32) i32 { return @bitCast(memRead32(s, addr)); }
 inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
     if (addr >= @as(u32, @truncate(s.memory_size))) { s.faulted = true; s.halted = true; return; }
+    // Record every write to the watchpoint address (do not halt — let execution continue
+    // so we can see the LATEST write when the crash diagnostic runs).
+    if (s.watchpoint != 0 and addr == s.watchpoint) {
+        s.watchpoint_eip = s.eip;
+        s.watchpoint_val = v;
+        s.watchpoint_hit = true;
+    }
     s.memory[addr] = v;
 }
 inline fn memWrite16(s: *CpuState, addr: u32, v: u16) void {
@@ -1829,6 +1840,11 @@ export fn cpu_fpu_get_control(s: *CpuState) u16 { return s.fpu_control_word; }
 export fn cpu_fpu_set_control(s: *CpuState, val: u16) void { s.fpu_control_word = val; }
 export fn cpu_fpu_get_tag(s: *CpuState) u16 { return s.fpu_tag_word; }
 export fn cpu_fpu_set_tag(s: *CpuState, val: u16) void { s.fpu_tag_word = val; }
+export fn cpu_set_watchpoint(s: *CpuState, addr: u32) void { s.watchpoint = addr; s.watchpoint_hit = false; }
+export fn cpu_clear_watchpoint(s: *CpuState) void { s.watchpoint = 0; s.watchpoint_hit = false; }
+export fn cpu_watchpoint_hit(s: *CpuState) bool { return s.watchpoint_hit; }
+export fn cpu_watchpoint_eip(s: *CpuState) u32 { return s.watchpoint_eip; }
+export fn cpu_watchpoint_val(s: *CpuState) u32 { return s.watchpoint_val; }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 const testing = std.testing;
