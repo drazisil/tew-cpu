@@ -87,12 +87,15 @@ inline fn memRead32(s: *CpuState, addr: u32) u32 {
 inline fn memReadS32(s: *CpuState, addr: u32) i32 { return @bitCast(memRead32(s, addr)); }
 inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
     if (addr >= @as(u32, @truncate(s.memory_size))) { s.faulted = true; s.halted = true; return; }
-    // Record every write to the watchpoint address (do not halt — let execution continue
-    // so we can see the LATEST write when the crash diagnostic runs).
+    // Halt immediately on watchpoint hit so Python sees the call stack at the moment
+    // of the write, not some later write in the same batch.
     if (s.watchpoint != 0 and addr == s.watchpoint) {
         s.watchpoint_eip = s.eip;
         s.watchpoint_val = v;
         s.watchpoint_hit = true;
+        s.memory[addr] = v;
+        s.halted = true;
+        return;
     }
     s.memory[addr] = v;
 }
@@ -1051,8 +1054,13 @@ fn opA0(s: *CpuState) void { // MOV AL, [disp32]
     const addr = applySegOvr(s, fetch32(s));
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | memRead8(s, addr);
 }
-fn opA1(s: *CpuState) void { // MOV EAX, [disp32]
-    s.regs[EAX] = memRead32(s, applySegOvr(s, fetch32(s)));
+fn opA1(s: *CpuState) void { // MOV EAX, [disp32]  (66-prefix: MOV AX, [disp32])
+    const addr = applySegOvr(s, fetch32(s));
+    if (s.op_size_ovr) {
+        s.regs[EAX] = @as(u32, memRead16(s, addr));  // zero-extend AX into EAX
+    } else {
+        s.regs[EAX] = memRead32(s, addr);
+    }
 }
 fn opA2(s: *CpuState) void { // MOV [disp32], AL
     memWrite8(s, applySegOvr(s, fetch32(s)), @truncate(s.regs[EAX]));
