@@ -1,302 +1,79 @@
+// cpu.zig — One-byte opcode handlers, dispatch table, execution engine, C API.
+// Shared types/helpers live in core.zig. FPU ops in fpu.zig. 0x0F ops in two_byte.zig.
 const std = @import("std");
+const core = @import("core.zig");
+const fpu = @import("fpu.zig");
+const two_byte = @import("two_byte.zig");
 
-// ─── Register indices ────────────────────────────────────────────────────────
-const EAX: u3 = 0;
-const ECX: u3 = 1;
-const EDX: u3 = 2;
-const EBX: u3 = 3;
-const ESP: u3 = 4;
-const EBP: u3 = 5;
-const ESI: u3 = 6;
-const EDI: u3 = 7;
+// ─── Type and constant aliases from core ────────────────────────────────────
+const CpuState = core.CpuState;
+const EAX = core.EAX; const ECX = core.ECX; const EDX = core.EDX; const EBX = core.EBX;
+const ESP = core.ESP; const EBP = core.EBP; const ESI = core.ESI; const EDI = core.EDI;
+const CF_BIT = core.CF_BIT; const PF_BIT = core.PF_BIT; const ZF_BIT = core.ZF_BIT;
+const SF_BIT = core.SF_BIT; const DF_BIT = core.DF_BIT; const OF_BIT = core.OF_BIT;
+const SEG_NONE = core.SEG_NONE; const SEG_FS = core.SEG_FS; const SEG_GS = core.SEG_GS;
+const REP_NONE = core.REP_NONE; const REP_REP = core.REP_REP; const REP_REPNE = core.REP_REPNE;
+const IntHandlerFn = core.IntHandlerFn;
+const OpFn = core.OpFn;
+const RunResult = core.RunResult;
+const RmInfo = core.RmInfo;
+const Rm8Result = core.Rm8Result;
+const Rm32Result = core.Rm32Result;
+const ModRm = core.ModRm;
 
-// ─── EFLAGS bit positions ─────────────────────────────────────────────────────
-const CF_BIT: u5 = 0;
-const PF_BIT: u5 = 2;
-const ZF_BIT: u5 = 6;
-const SF_BIT: u5 = 7;
-const DF_BIT: u5 = 10;
-const OF_BIT: u5 = 11;
+// ─── Helper aliases from core ────────────────────────────────────────────────
+const memRead8 = core.memRead8;
+const memRead16 = core.memRead16;
+const memRead32 = core.memRead32;
+const memWrite8 = core.memWrite8;
+const memWrite16 = core.memWrite16;
+const memWrite32 = core.memWrite32;
+const fetch8 = core.fetch8;
+const fetch32 = core.fetch32;
+const fetchS8 = core.fetchS8;
+const fetchS32 = core.fetchS32;
+const getFlag = core.getFlag;
+const setFlag = core.setFlag;
+const updateFlagsArith = core.updateFlagsArith;
+const updateFlagsLogic = core.updateFlagsLogic;
+const readReg8 = core.readReg8;
+const writeReg8 = core.writeReg8;
+const push32 = core.push32;
+const pop32 = core.pop32;
+const applySegOvr = core.applySegOvr;
+const decodeModRM = core.decodeModRM;
+const resolveRm = core.resolveRm;
+const readRm8 = core.readRm8;
+const writeRm8 = core.writeRm8;
+const readRm32 = core.readRm32;
+const writeRm32 = core.writeRm32;
+const readRm8Resolved = core.readRm8Resolved;
+const writeRm8Resolved = core.writeRm8Resolved;
+const readRm32Resolved = core.readRm32Resolved;
+const writeRm32Resolved = core.writeRm32Resolved;
+const evalCond = core.evalCond;
+const opFault = core.opFault;
 
-// ─── Segment override tokens ─────────────────────────────────────────────────
-const SEG_NONE: u8 = 0;
-const SEG_FS: u8 = 1;
-const SEG_GS: u8 = 2;
-
-// ─── REP prefix tokens ───────────────────────────────────────────────────────
-const REP_NONE: u8 = 0;
-const REP_REP: u8 = 1;
-const REP_REPNE: u8 = 2;
-
-// ─── Public types ─────────────────────────────────────────────────────────────
-pub const IntHandlerFn = *const fn (state: *anyopaque, int_num: u8) callconv(.C) void;
-pub const OpFn = *const fn (*CpuState) void;
-
-pub const RunResult = enum(c_int) {
-    ok = 0,
-    halted = 1,
-    faulted = 2,
-    step_limit = 3,
-};
-
-pub const CpuState = struct {
-    regs: [8]u32 = .{0} ** 8,
-    eip: u32 = 0,
-    eflags: u32 = 0,
-    fpu_stack: [8]f64 = .{0.0} ** 8,
-    fpu_top: u32 = 0,
-    fpu_status_word: u16 = 0,
-    fpu_control_word: u16 = 0x037F,
-    fpu_tag_word: u16 = 0xFFFF,
-    halted: bool = false,
-    faulted: bool = false,
-    fs_base: u32 = 0,
-    gs_base: u32 = 0,
-    step_count: u64 = 0,
-    last_opcode: u8 = 0,
-    int_handler: ?IntHandlerFn = null,
-    memory: [*]u8 = undefined,
-    memory_size: usize = 0,
-    seg_override: u8 = SEG_NONE,
-    rep_prefix: u8 = REP_NONE,
-    op_size_ovr: bool = false,
-    watchpoint: u32 = 0,         // address to watch (0 = disabled)
-    watchpoint_eip: u32 = 0,     // EIP when watchpoint fired
-    watchpoint_val: u32 = 0,     // value written to watchpoint address
-    watchpoint_hit: bool = false,
-};
-
-// ─── Internal helper structs ─────────────────────────────────────────────────
-const RmInfo = struct { is_reg: bool, addr: u32 };
-const Rm8Result = struct { value: u8, is_reg: bool, addr: u32 };
-const Rm32Result = struct { value: u32, is_reg: bool, addr: u32 };
-const ModRm = struct { mod: u8, reg: u8, rm: u8 };
-
-// ─── Memory access ────────────────────────────────────────────────────────────
-inline fn memRead8(s: *CpuState, addr: u32) u8 {
-    if (addr >= @as(u32, @truncate(s.memory_size))) { s.faulted = true; s.halted = true; return 0; }
-    return s.memory[addr];
-}
-inline fn memRead16(s: *CpuState, addr: u32) u16 {
-    return @as(u16, memRead8(s, addr)) | (@as(u16, memRead8(s, addr + 1)) << 8);
-}
-inline fn memRead32(s: *CpuState, addr: u32) u32 {
-    return @as(u32, memRead8(s, addr)) | (@as(u32, memRead8(s, addr + 1)) << 8) |
-           (@as(u32, memRead8(s, addr + 2)) << 16) | (@as(u32, memRead8(s, addr + 3)) << 24);
-}
-inline fn memReadS32(s: *CpuState, addr: u32) i32 { return @bitCast(memRead32(s, addr)); }
-inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
-    if (addr >= @as(u32, @truncate(s.memory_size))) { s.faulted = true; s.halted = true; return; }
-    // Halt immediately on watchpoint hit so Python sees the call stack at the moment
-    // of the write, not some later write in the same batch.
-    if (s.watchpoint != 0 and addr == s.watchpoint) {
-        s.watchpoint_eip = s.eip;
-        s.watchpoint_val = v;
-        s.watchpoint_hit = true;
-        s.memory[addr] = v;
-        s.halted = true;
-        return;
-    }
-    s.memory[addr] = v;
-}
-inline fn memWrite16(s: *CpuState, addr: u32, v: u16) void {
-    memWrite8(s, addr, @truncate(v));
-    memWrite8(s, addr + 1, @truncate(v >> 8));
-}
-inline fn memWrite32(s: *CpuState, addr: u32, v: u32) void {
-    memWrite8(s, addr, @truncate(v));
-    memWrite8(s, addr + 1, @truncate(v >> 8));
-    memWrite8(s, addr + 2, @truncate(v >> 16));
-    memWrite8(s, addr + 3, @truncate(v >> 24));
-}
-
-// ─── Fetch helpers ────────────────────────────────────────────────────────────
-inline fn fetch8(s: *CpuState) u8 {
-    const v = memRead8(s, s.eip);
-    s.eip +%= 1;
-    return v;
-}
+// ─── Local helpers not in core ───────────────────────────────────────────────
 inline fn fetch16(s: *CpuState) u16 {
-    const v = memRead16(s, s.eip);
-    s.eip +%= 2;
-    return v;
+    const v = memRead16(s, s.eip); s.eip +%= 2; return v;
 }
-inline fn fetch32(s: *CpuState) u32 {
-    const v = memRead32(s, s.eip);
-    s.eip +%= 4;
-    return v;
-}
-inline fn fetchS8(s: *CpuState) i8 { return @bitCast(fetch8(s)); }
-inline fn fetchS32(s: *CpuState) i32 { return @bitCast(fetch32(s)); }
 inline fn fetchImm(s: *CpuState) u32 {
     return if (s.op_size_ovr) @as(u32, fetch16(s)) else fetch32(s);
 }
 inline fn fetchSImm(s: *CpuState) i32 {
-    if (s.op_size_ovr) {
-        const v = fetch16(s);
-        return @as(i32, @as(i16, @bitCast(v)));
-    }
+    if (s.op_size_ovr) { const v = fetch16(s); return @as(i32, @as(i16, @bitCast(v))); }
     return fetchS32(s);
 }
-
-// ─── Flag helpers ─────────────────────────────────────────────────────────────
-inline fn getFlag(s: *CpuState, bit: u5) bool { return ((s.eflags >> bit) & 1) != 0; }
-inline fn setFlag(s: *CpuState, bit: u5, v: bool) void {
-    if (v) s.eflags |= @as(u32, 1) << bit else s.eflags &= ~(@as(u32, 1) << bit);
-}
-fn updateFlagsArith(s: *CpuState, result_raw: i64, op1: u32, op2: u32, is_sub: bool) void {
-    const r32: u32 = @truncate(@as(u64, @bitCast(result_raw)));
-    setFlag(s, ZF_BIT, r32 == 0);
-    setFlag(s, SF_BIT, (r32 & 0x80000000) != 0);
-    var p: u8 = @truncate(r32);
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
-    setFlag(s, PF_BIT, (p & 1) == 0);
-    if (is_sub) {
-        setFlag(s, CF_BIT, op1 < op2);
-    } else {
-        setFlag(s, CF_BIT, r32 < op1 or r32 < op2);
-    }
-    const s1 = (op1 & 0x80000000) != 0;
-    const s2 = (op2 & 0x80000000) != 0;
-    const sr = (r32 & 0x80000000) != 0;
-    if (is_sub) {
-        setFlag(s, OF_BIT, s1 != s2 and sr != s1);
-    } else {
-        setFlag(s, OF_BIT, s1 == s2 and sr != s1);
-    }
-}
-fn updateFlagsLogic(s: *CpuState, result: u32) void {
-    setFlag(s, ZF_BIT, result == 0);
-    setFlag(s, SF_BIT, (result & 0x80000000) != 0);
-    setFlag(s, CF_BIT, false);
-    setFlag(s, OF_BIT, false);
-    var p: u8 = @truncate(result);
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
-    setFlag(s, PF_BIT, (p & 1) == 0);
-}
 fn updateFlagsLogic8(s: *CpuState, result: u8) void {
-    setFlag(s, ZF_BIT, result == 0);
-    setFlag(s, SF_BIT, (result & 0x80) != 0);
-    setFlag(s, CF_BIT, false);
-    setFlag(s, OF_BIT, false);
-    var p: u8 = result;
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+    setFlag(s, ZF_BIT, result == 0); setFlag(s, SF_BIT, (result & 0x80) != 0);
+    setFlag(s, CF_BIT, false); setFlag(s, OF_BIT, false);
+    var p: u8 = result; p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
-}
-
-// ─── 8-bit register helpers ──────────────────────────────────────────────────
-inline fn readReg8(s: *CpuState, idx: u8) u8 {
-    return if (idx < 4) @truncate(s.regs[idx]) else @truncate(s.regs[idx - 4] >> 8);
-}
-inline fn writeReg8(s: *CpuState, idx: u8, v: u8) void {
-    if (idx < 4) {
-        s.regs[idx] = (s.regs[idx] & 0xFFFFFF00) | @as(u32, v);
-    } else {
-        s.regs[idx - 4] = (s.regs[idx - 4] & 0xFFFF00FF) | (@as(u32, v) << 8);
-    }
-}
-
-// ─── Stack helpers ────────────────────────────────────────────────────────────
-inline fn push32(s: *CpuState, v: u32) void {
-    s.regs[ESP] -%= 4;
-    memWrite32(s, s.regs[ESP], v);
-}
-inline fn pop32(s: *CpuState) u32 {
-    const v = memRead32(s, s.regs[ESP]);
-    s.regs[ESP] +%= 4;
-    return v;
-}
-
-// ─── Segment override ─────────────────────────────────────────────────────────
-inline fn applySegOvr(s: *CpuState, addr: u32) u32 {
-    return switch (s.seg_override) {
-        SEG_FS => s.fs_base +% addr,
-        SEG_GS => s.gs_base +% addr,
-        else => addr,
-    };
-}
-
-// ─── ModRM decode ─────────────────────────────────────────────────────────────
-fn decodeModRM(s: *CpuState) ModRm {
-    const b = fetch8(s);
-    return .{ .mod = (b >> 6) & 3, .reg = (b >> 3) & 7, .rm = b & 7 };
-}
-fn decodeSIB(s: *CpuState, mod: u8) u32 {
-    const sib = fetch8(s);
-    const scale: u32 = @as(u32, 1) << @as(u2, @truncate(sib >> 6));
-    const index: u8 = (sib >> 3) & 7;
-    const base: u8 = sib & 7;
-    var addr: u32 = if (base == 5 and mod == 0) fetch32(s) else s.regs[base];
-    if (index != 4) addr +%= s.regs[index] *% scale;
-    return addr;
-}
-fn resolveRm(s: *CpuState, mod: u8, rm: u8) RmInfo {
-    if (mod == 3) return .{ .is_reg = true, .addr = rm };
-    const addr: u32 = switch (mod) {
-        0 => switch (rm) {
-            5 => fetch32(s),
-            4 => decodeSIB(s, mod),
-            else => s.regs[rm],
-        },
-        1 => blk: {
-            if (rm == 4) {
-                const base = decodeSIB(s, mod);
-                break :blk base +% @as(u32, @bitCast(@as(i32, fetchS8(s))));
-            }
-            break :blk s.regs[rm] +% @as(u32, @bitCast(@as(i32, fetchS8(s))));
-        },
-        2 => blk: {
-            if (rm == 4) {
-                const base = decodeSIB(s, mod);
-                break :blk base +% @as(u32, @bitCast(fetchS32(s)));
-            }
-            break :blk s.regs[rm] +% @as(u32, @bitCast(fetchS32(s)));
-        },
-        else => unreachable,
-    };
-    return .{ .is_reg = false, .addr = addr };
-}
-
-// ─── rm read/write helpers ────────────────────────────────────────────────────
-fn readRm8(s: *CpuState, mod: u8, rm: u8) u8 {
-    const r = resolveRm(s, mod, rm);
-    return if (r.is_reg) readReg8(s, @truncate(r.addr)) else memRead8(s, applySegOvr(s, r.addr));
-}
-fn writeRm8(s: *CpuState, mod: u8, rm: u8, v: u8) void {
-    const r = resolveRm(s, mod, rm);
-    if (r.is_reg) writeReg8(s, @truncate(r.addr), v) else memWrite8(s, applySegOvr(s, r.addr), v);
-}
-fn readRm8Resolved(s: *CpuState, mod: u8, rm: u8) Rm8Result {
-    const r = resolveRm(s, mod, rm);
-    const addr = if (r.is_reg) r.addr else applySegOvr(s, r.addr);
-    const v: u8 = if (r.is_reg) readReg8(s, @truncate(r.addr)) else memRead8(s, addr);
-    return .{ .value = v, .is_reg = r.is_reg, .addr = addr };
-}
-fn writeRm8Resolved(s: *CpuState, is_reg: bool, addr: u32, v: u8) void {
-    if (is_reg) writeReg8(s, @truncate(addr), v) else memWrite8(s, addr, v);
-}
-fn readRm32(s: *CpuState, mod: u8, rm: u8) u32 {
-    const r = resolveRm(s, mod, rm);
-    return if (r.is_reg) s.regs[r.addr] else memRead32(s, applySegOvr(s, r.addr));
-}
-fn writeRm32(s: *CpuState, mod: u8, rm: u8, v: u32) void {
-    const r = resolveRm(s, mod, rm);
-    if (r.is_reg) s.regs[r.addr] = v else memWrite32(s, applySegOvr(s, r.addr), v);
-}
-fn readRm32Resolved(s: *CpuState, mod: u8, rm: u8) Rm32Result {
-    const r = resolveRm(s, mod, rm);
-    const addr = if (r.is_reg) r.addr else applySegOvr(s, r.addr);
-    const v: u32 = if (r.is_reg) s.regs[r.addr] else memRead32(s, addr);
-    return .{ .value = v, .is_reg = r.is_reg, .addr = addr };
-}
-fn writeRm32Resolved(s: *CpuState, is_reg: bool, addr: u32, v: u32) void {
-    if (is_reg) s.regs[addr] = v else memWrite32(s, addr, v);
 }
 fn readRmv(s: *CpuState, mod: u8, rm: u8) u32 {
     const r = resolveRm(s, mod, rm);
-    if (r.is_reg) {
-        return if (s.op_size_ovr) s.regs[r.addr] & 0xFFFF else s.regs[r.addr];
-    }
+    if (r.is_reg) return if (s.op_size_ovr) s.regs[r.addr] & 0xFFFF else s.regs[r.addr];
     const addr = applySegOvr(s, r.addr);
     return if (s.op_size_ovr) @as(u32, memRead16(s, addr)) else memRead32(s, addr);
 }
@@ -334,93 +111,6 @@ inline fn writeEaxv(s: *CpuState, v: u32) void {
     if (s.op_size_ovr) s.regs[EAX] = (s.regs[EAX] & 0xFFFF0000) | (v & 0xFFFF)
     else s.regs[EAX] = v;
 }
-
-// ─── FPU helpers ──────────────────────────────────────────────────────────────
-inline fn fpuGet(s: *CpuState, i: u8) f64 {
-    return s.fpu_stack[(@as(u8, @truncate(s.fpu_top)) +% i) & 7];
-}
-inline fn fpuSet(s: *CpuState, i: u8, v: f64) void {
-    const idx: u8 = (@as(u8, @truncate(s.fpu_top)) +% i) & 7;
-    s.fpu_stack[idx] = v;
-    s.fpu_tag_word &= ~(@as(u16, 3) << (@as(u4, @truncate(idx)) * 2));
-}
-fn fpuPush(s: *CpuState, v: f64) void {
-    s.fpu_top = (s.fpu_top -% 1) & 7;
-    s.fpu_stack[s.fpu_top] = v;
-    s.fpu_tag_word &= ~(@as(u16, 3) << (@as(u4, @truncate(s.fpu_top)) * 2));
-    s.fpu_status_word = (s.fpu_status_word & ~@as(u16, 0x3800)) |
-                        @as(u16, @truncate((s.fpu_top & 7) << 11));
-}
-fn fpuPop(s: *CpuState) f64 {
-    const v = s.fpu_stack[s.fpu_top & 7];
-    s.fpu_tag_word |= @as(u16, 3) << (@as(u4, @truncate(s.fpu_top & 7)) * 2);
-    s.fpu_top = (s.fpu_top +% 1) & 7;
-    s.fpu_status_word = (s.fpu_status_word & ~@as(u16, 0x3800)) |
-                        @as(u16, @truncate((s.fpu_top & 7) << 11));
-    return v;
-}
-fn fpuSetCC(s: *CpuState, c3: bool, c2: bool, c0: bool) void {
-    s.fpu_status_word &= ~@as(u16, 0x4500);
-    if (c0) s.fpu_status_word |= 0x0100;
-    if (c2) s.fpu_status_word |= 0x0400;
-    if (c3) s.fpu_status_word |= 0x4000;
-}
-fn fpuCompare(s: *CpuState, a: f64, b: f64) void {
-    if (std.math.isNan(a) or std.math.isNan(b)) {
-        fpuSetCC(s, true, true, true);
-    } else if (a > b) {
-        fpuSetCC(s, false, false, false);
-    } else if (a < b) {
-        fpuSetCC(s, false, false, true);
-    } else {
-        fpuSetCC(s, true, false, false);
-    }
-}
-fn fpuComi(s: *CpuState, a: f64, b: f64, do_pop: bool) void {
-    if (std.math.isNan(a) or std.math.isNan(b)) {
-        setFlag(s, ZF_BIT, true); setFlag(s, CF_BIT, true);
-    } else if (a > b) {
-        setFlag(s, ZF_BIT, false); setFlag(s, CF_BIT, false);
-    } else if (a < b) {
-        setFlag(s, ZF_BIT, false); setFlag(s, CF_BIT, true);
-    } else {
-        setFlag(s, ZF_BIT, true); setFlag(s, CF_BIT, false);
-    }
-    setFlag(s, OF_BIT, false);
-    if (do_pop) _ = fpuPop(s);
-}
-
-// ─── Float I/O ────────────────────────────────────────────────────────────────
-fn readFloat(s: *CpuState, addr: u32) f32 { return @bitCast(memRead32(s, addr)); }
-fn writeFloat(s: *CpuState, addr: u32, v: f32) void { memWrite32(s, addr, @bitCast(v)); }
-fn readDouble(s: *CpuState, addr: u32) f64 {
-    const lo = memRead32(s, addr);
-    const hi = memRead32(s, addr + 4);
-    const bits: u64 = (@as(u64, hi) << 32) | @as(u64, lo);
-    return @bitCast(bits);
-}
-fn writeDouble(s: *CpuState, addr: u32, v: f64) void {
-    const bits: u64 = @bitCast(v);
-    memWrite32(s, addr, @truncate(bits));
-    memWrite32(s, addr + 4, @truncate(bits >> 32));
-}
-
-// ─── Condition evaluation (for Jcc/SETcc/CMOVcc) ─────────────────────────────
-fn evalCond(s: *CpuState, cond: u8) bool {
-    const cf = getFlag(s, CF_BIT); const zf = getFlag(s, ZF_BIT);
-    const sf = getFlag(s, SF_BIT); const of = getFlag(s, OF_BIT);
-    const pf = getFlag(s, PF_BIT);
-    return switch (cond & 0xF) {
-        0x0 => of, 0x1 => !of, 0x2 => cf, 0x3 => !cf,
-        0x4 => zf, 0x5 => !zf, 0x6 => cf or zf, 0x7 => !cf and !zf,
-        0x8 => sf, 0x9 => !sf, 0xA => pf, 0xB => !pf,
-        0xC => sf != of, 0xD => sf == of, 0xE => zf or (sf != of),
-        0xF => !zf and (sf == of), else => false,
-    };
-}
-
-// ─── Fault / prefix ───────────────────────────────────────────────────────────
-fn opFault(s: *CpuState) void { s.faulted = true; s.halted = true; }
 fn clearPrefixes(s: *CpuState) void {
     s.seg_override = SEG_NONE; s.rep_prefix = REP_NONE; s.op_size_ovr = false;
 }
@@ -430,6 +120,7 @@ fn isPrefix(b: u8) bool {
         else => false,
     };
 }
+inline fn strDir(s: *CpuState) i32 { return if (getFlag(s, DF_BIT)) -1 else 1; }
 
 // ─── Group 1 helper (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) ────────────────────────
 fn doGroup1(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, op1: u32, op2: u32) void {
@@ -479,7 +170,7 @@ fn doGroup2(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u32, count: 
             const r = val << c5;
             const new_cf = ((val >> @as(u5, @truncate(32 - @as(u8, count)))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogic(s, r); // NOTE: update_flags_logic clears CF (matches Python)
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogic(s, r);
         },
         5 => { // SHR
             const r = val >> c5;
@@ -500,14 +191,14 @@ fn doGroup2(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u32, count: 
 fn doGroup2_8(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u8, count: u8) void {
     if (count == 0) { writeRm8Resolved(s, is_reg, addr, val); return; }
     switch (op_ext) {
-        0 => { // ROL r/m8, count
+        0 => { // ROL r/m8
             const c8: u3 = @truncate(count & 7);
             const r: u8 = if (c8 == 0) val else (val << c8) | (val >> @as(u3, @truncate(8 - @as(u8, c8))));
             writeRm8Resolved(s, is_reg, addr, r);
             setFlag(s, CF_BIT, (r & 1) != 0);
             if ((count & 0x1F) == 1) setFlag(s, OF_BIT, ((r & 0x80) != 0) != ((r & 1) != 0));
         },
-        1 => { // ROR r/m8, count
+        1 => { // ROR r/m8
             const c8: u3 = @truncate(count & 7);
             const r: u8 = if (c8 == 0) val else (val >> c8) | (val << @as(u3, @truncate(8 - @as(u8, c8))));
             writeRm8Resolved(s, is_reg, addr, r);
@@ -536,25 +227,26 @@ fn doGroup2_8(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u8, count:
             }
             writeRm8Resolved(s, is_reg, addr, temp); setFlag(s, CF_BIT, cf);
         },
-        4, 6 => { // SHL/SAL r/m8
-            const r: u8 = if (count >= 8) 0 else val << @as(u3, @truncate(count));
+        4 => { // SHL r/m8
+            const c8: u3 = @truncate(count & 7);
+            const r: u8 = if (c8 == 0) val else val << c8;
+            const new_cf = if (count <= 8) ((val >> @as(u3, @truncate(8 - @as(u8, count)))) & 1) != 0 else false;
             writeRm8Resolved(s, is_reg, addr, r);
-            updateFlagsLogic8(s, r);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogic8(s, r);
         },
         5 => { // SHR r/m8
-            const r: u8 = if (count >= 8) 0 else val >> @as(u3, @truncate(count));
-            const new_cf: bool = if (count <= 8) ((val >> @as(u3, @truncate(count - 1))) & 1) != 0 else false;
+            const c8: u3 = @truncate(count & 7);
+            const r: u8 = if (c8 == 0) val else val >> c8;
+            const new_cf = ((val >> @as(u3, @truncate(count - 1))) & 1) != 0;
             writeRm8Resolved(s, is_reg, addr, r);
-            updateFlagsLogic8(s, r); setFlag(s, CF_BIT, new_cf);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogic8(s, r);
         },
         7 => { // SAR r/m8
-            const effective: u3 = if (count > 7) @as(u3, 7) else @truncate(count);
-            const sval: i8 = @bitCast(val);
-            const r: u8 = @bitCast(sval >> effective);
-            const shifted_out: u3 = if (count > 8) @as(u3, 7) else @truncate(count - 1);
-            const new_cf = ((val >> shifted_out) & 1) != 0;
+            const c8: u3 = @truncate(count & 7);
+            const r: u8 = @bitCast(@as(i8, @bitCast(val)) >> c8);
+            const new_cf = ((val >> @as(u3, @truncate(count - 1))) & 1) != 0;
             writeRm8Resolved(s, is_reg, addr, r);
-            updateFlagsLogic8(s, r); setFlag(s, CF_BIT, new_cf);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogic8(s, r);
         },
         else => { s.faulted = true; s.halted = true; },
     }
@@ -1056,11 +748,8 @@ fn opA0(s: *CpuState) void { // MOV AL, [disp32]
 }
 fn opA1(s: *CpuState) void { // MOV EAX, [disp32]  (66-prefix: MOV AX, [disp32])
     const addr = applySegOvr(s, fetch32(s));
-    if (s.op_size_ovr) {
-        s.regs[EAX] = @as(u32, memRead16(s, addr));  // zero-extend AX into EAX
-    } else {
-        s.regs[EAX] = memRead32(s, addr);
-    }
+    if (s.op_size_ovr) s.regs[EAX] = @as(u32, memRead16(s, addr))
+    else s.regs[EAX] = memRead32(s, addr);
 }
 fn opA2(s: *CpuState) void { // MOV [disp32], AL
     memWrite8(s, applySegOvr(s, fetch32(s)), @truncate(s.regs[EAX]));
@@ -1101,7 +790,7 @@ fn opC5(s: *CpuState) void { // LDS r32, m (flat: load offset, ignore seg)
     const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm);
     if (!r.is_reg) s.regs[d.reg] = memRead32(s, applySegOvr(s, r.addr));
 }
-fn op0E(s: *CpuState) void { push32(s, 0x1B); }  // PUSH CS (flat CS=0x1B)
+fn op0E(s: *CpuState) void { push32(s, 0x1B); }  // PUSH CS
 fn op06(s: *CpuState) void { push32(s, 0x23); }  // PUSH ES
 fn op16(s: *CpuState) void { push32(s, 0x23); }  // PUSH SS
 fn op1E(s: *CpuState) void { push32(s, 0x23); }  // PUSH DS
@@ -1124,10 +813,6 @@ fn opEB(s: *CpuState) void { // JMP rel8
 fn opJcc8(comptime cond: u8) OpFn { return struct { fn f(s: *CpuState) void {
     const rel: i8 = fetchS8(s);
     if (evalCond(s, cond)) s.eip = s.eip +% @as(u32, @bitCast(@as(i32, rel)));
-}}.f; }
-fn opJccNear(comptime cond: u8) OpFn { return struct { fn f(s: *CpuState) void {
-    const rel: i32 = fetchS32(s);
-    if (evalCond(s, cond)) s.eip = s.eip +% @as(u32, @bitCast(rel));
 }}.f; }
 fn opE0(s: *CpuState) void { // LOOPNE
     const rel: i8 = fetchS8(s); s.regs[ECX] -%= 1;
@@ -1162,14 +847,14 @@ fn op68(s: *CpuState) void { push32(s, fetch32(s)); }  // PUSH imm32
 fn op6A(s: *CpuState) void { push32(s, @bitCast(@as(i32, fetchS8(s)))); }  // PUSH imm8 sign-ext
 
 // ─── Misc opcodes ─────────────────────────────────────────────────────────────
-fn opNop(_: *CpuState) void {}   // NOP
+fn opNop(_: *CpuState) void {}
 fn opF4(s: *CpuState) void { s.halted = true; }  // HLT
 fn opFC(s: *CpuState) void { setFlag(s, DF_BIT, false); }  // CLD
 fn opFD(s: *CpuState) void { setFlag(s, DF_BIT, true); }   // STD
 fn opF8(s: *CpuState) void { setFlag(s, CF_BIT, false); }  // CLC
 fn opF9(s: *CpuState) void { setFlag(s, CF_BIT, true); }   // STC
 fn opF5(s: *CpuState) void { setFlag(s, CF_BIT, !getFlag(s, CF_BIT)); }  // CMC
-fn op9B(_: *CpuState) void {}   // WAIT/FWAIT — no-op
+fn op9B(_: *CpuState) void {}   // WAIT/FWAIT
 fn op9C(s: *CpuState) void { push32(s, s.eflags & 0xFCFFFF); }  // PUSHFD
 fn op9D(s: *CpuState) void { s.eflags = pop32(s) & 0xFCFFFF; }  // POPFD
 fn op9E(s: *CpuState) void { // SAHF
@@ -1201,8 +886,6 @@ fn opCD(s: *CpuState) void { // INT imm8
 }
 
 // ─── String opcodes ───────────────────────────────────────────────────────────
-inline fn strDir(s: *CpuState) i32 { return if (getFlag(s, DF_BIT)) -1 else 1; }
-
 fn opAA(s: *CpuState) void { // STOSB
     if (s.rep_prefix == REP_REP) {
         while (s.regs[ECX] != 0) {
@@ -1409,334 +1092,13 @@ fn opFF(s: *CpuState) void { // Group 5: INC/DEC/CALL/JMP/PUSH rm32
     }
 }
 
-// ─── Two-byte opcodes (0x0F prefix) ──────────────────────────────────────────
-fn op0F(s: *CpuState) void {
-    const op2 = fetch8(s);
-    switch (op2) {
-        0xB6 => { // MOVZX r32, rm8
-            const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm);
-            s.regs[d.reg] = if (r.is_reg) s.regs[r.addr] & 0xFF else memRead8(s, applySegOvr(s, r.addr));
-        },
-        0xB7 => { // MOVZX r32, rm16
-            const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm);
-            s.regs[d.reg] = if (r.is_reg) s.regs[r.addr] & 0xFFFF else @as(u32, memRead16(s, applySegOvr(s, r.addr)));
-        },
-        0xBE => { // MOVSX r32, rm8
-            const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm);
-            const v: u8 = if (r.is_reg) @truncate(s.regs[r.addr]) else memRead8(s, applySegOvr(s, r.addr));
-            s.regs[d.reg] = @bitCast(@as(i32, @as(i8, @bitCast(v))));
-        },
-        0xBF => { // MOVSX r32, rm16
-            const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm);
-            const v: u16 = if (r.is_reg) @truncate(s.regs[r.addr]) else memRead16(s, applySegOvr(s, r.addr));
-            s.regs[d.reg] = @bitCast(@as(i32, @as(i16, @bitCast(v))));
-        },
-        0xAF => { // IMUL r32, rm32
-            const d = decodeModRM(s);
-            const imul_op1: i64 = @as(i32, @bitCast(s.regs[d.reg]));
-            const imul_op2: i64 = @as(i32, @bitCast(readRm32(s, d.mod, d.rm)));
-            const r32: u32 = @truncate(@as(u64, @bitCast(imul_op1 * imul_op2)));
-            s.regs[d.reg] = r32;
-            const ov = (imul_op1 * imul_op2) != @as(i64, @as(i32, @bitCast(r32)));
-            setFlag(s, CF_BIT, ov); setFlag(s, OF_BIT, ov);
-        },
-        0x90...0x9F => { // SETcc rm8
-            const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm);
-            const v: u8 = if (evalCond(s, op2 & 0xF)) 1 else 0;
-            if (r.is_reg) s.regs[r.addr] = (s.regs[r.addr] & 0xFFFFFF00) | v
-            else memWrite8(s, applySegOvr(s, r.addr), v);
-        },
-        0x80...0x8F => { // Jcc rel32 (near)
-            const rel = fetchS32(s);
-            if (evalCond(s, op2 & 0xF)) s.eip = s.eip +% @as(u32, @bitCast(rel));
-        },
-        0xC1 => { // XADD rm32, r32
-            const d = decodeModRM(s); const dst = readRm32(s, d.mod, d.rm); const src = s.regs[d.reg];
-            s.regs[d.reg] = dst; writeRm32(s, d.mod, d.rm, dst +% src);
-            updateFlagsArith(s, @as(i64, dst) + @as(i64, src), dst, src, false);
-        },
-        0xBD => { // BSR r32, rm32
-            const d = decodeModRM(s); const v = readRm32(s, d.mod, d.rm);
-            if (v == 0) setFlag(s, ZF_BIT, true)
-            else { setFlag(s, ZF_BIT, false); s.regs[d.reg] = 31 - @clz(v); }
-        },
-        0xBC => { // BSF r32, rm32
-            const d = decodeModRM(s); const v = readRm32(s, d.mod, d.rm);
-            if (v == 0) setFlag(s, ZF_BIT, true)
-            else { setFlag(s, ZF_BIT, false); s.regs[d.reg] = @ctz(v); }
-        },
-        0x40...0x4F => { // CMOVcc r32, rm32
-            const d = decodeModRM(s); const v = readRm32(s, d.mod, d.rm);
-            if (evalCond(s, op2 & 0xF)) s.regs[d.reg] = v;
-        },
-        0xC8...0xCF => { // BSWAP r32
-            const r: u8 = op2 & 7; const v = s.regs[r];
-            s.regs[r] = ((v & 0xFF) << 24) | (((v >> 8) & 0xFF) << 16) | (((v >> 16) & 0xFF) << 8) | (v >> 24);
-        },
-        0xA3 => { // BT rm32, r32
-            const d = decodeModRM(s); const bit: u5 = @truncate(s.regs[d.reg] & 0x1F);
-            setFlag(s, CF_BIT, ((readRm32(s, d.mod, d.rm) >> bit) & 1) != 0);
-        },
-        0xBA => { // Group 8: BT/BTS/BTR/BTC rm32, imm8
-            const d = decodeModRM(s); const bit: u5 = @truncate(fetch8(s) & 0x1F);
-            const v = readRm32(s, d.mod, d.rm); setFlag(s, CF_BIT, ((v >> bit) & 1) != 0);
-            switch (d.reg) {
-                5 => writeRm32(s, d.mod, d.rm, v | (@as(u32, 1) << bit)),
-                6 => writeRm32(s, d.mod, d.rm, v & ~(@as(u32, 1) << bit)),
-                7 => writeRm32(s, d.mod, d.rm, (v ^ (@as(u32, 1) << bit))),
-                else => {},
-            }
-        },
-        0x34 => { // SYSENTER — fast NT syscall gate (EAX=syscall#, EDX=arg stack)
-            if (s.int_handler) |h| h(s, 0x2E);
-        },
-        0x35 => { // SYSEXIT — fast return from kernel; EIP←ECX, ESP←EDX
-            s.eip = s.regs[ECX];
-            s.regs[ESP] = s.regs[EDX];
-        },
-        0xA2 => { // CPUID
-            const leaf = s.regs[EAX];
-            switch (leaf) {
-                0 => { s.regs[EAX] = 1; s.regs[EBX] = 0x756E6547; s.regs[EDX] = 0x49656E69; s.regs[ECX] = 0x6C65746E; },
-                1 => { s.regs[EAX] = 0x00000600; s.regs[EBX] = 0; s.regs[ECX] = 0; s.regs[EDX] = 0x00008001; },
-                else => { s.regs[EAX] = 0; s.regs[EBX] = 0; s.regs[ECX] = 0; s.regs[EDX] = 0; },
-            }
-        },
-        else => { s.faulted = true; s.halted = true; },
-    }
-}
-
-// ─── FPU opcodes (0xD8–0xDF) ─────────────────────────────────────────────────
-const FPU_CONSTS = [7]f64{ 1.0, 3.3219280948873626, 1.4426950408889634,
-    std.math.pi, 0.3010299956639812, std.math.ln2, 0.0 };
-
-fn opD8(s: *CpuState) void { // float32 ops
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        const st0 = fpuGet(s, 0); const sti = fpuGet(s, d.rm);
-        switch (d.reg) {
-            0 => fpuSet(s, 0, st0 + sti), 1 => fpuSet(s, 0, st0 * sti),
-            2 => fpuCompare(s, st0, sti), 3 => { fpuCompare(s, st0, sti); _ = fpuPop(s); },
-            4 => fpuSet(s, 0, st0 - sti), 5 => fpuSet(s, 0, sti - st0),
-            6 => fpuSet(s, 0, st0 / sti), 7 => fpuSet(s, 0, sti / st0),
-            else => {},
-        }
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        const val: f64 = readFloat(s, addr); const st0 = fpuGet(s, 0);
-        switch (d.reg) {
-            0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
-            4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
-            6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
-            else => {},
-        }
-    }
-}
-fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        switch (d.reg) {
-            0 => fpuPush(s, fpuGet(s, d.rm)),  // FLD ST(i)
-            1 => { const t = fpuGet(s, 0); fpuSet(s, 0, fpuGet(s, d.rm)); fpuSet(s, d.rm, t); },  // FXCH
-            2 => {},  // FNOP
-            3 => { fpuSet(s, d.rm, fpuGet(s, 0)); _ = fpuPop(s); },  // FSTP ST(i)
-            4 => switch (d.rm) {
-                0 => fpuSet(s, 0, -fpuGet(s, 0)),  // FCHS
-                1 => fpuSet(s, 0, @abs(fpuGet(s, 0))),  // FABS
-                4 => fpuCompare(s, fpuGet(s, 0), 0.0),  // FTST
-                5 => { s.fpu_status_word &= ~@as(u16, 0x4700); if (fpuGet(s, 0) < 0) s.fpu_status_word |= 0x0200; },  // FXAM
-                else => {},
-            },
-            5 => if (d.rm < 7) fpuPush(s, FPU_CONSTS[d.rm]),  // FLD constants
-            6 => switch (d.rm) {
-                0 => fpuSet(s, 0, std.math.exp2(fpuGet(s, 0)) - 1.0),  // F2XM1
-                1 => { const x = fpuGet(s, 0); const y = fpuGet(s, 1); _ = fpuPop(s); fpuSet(s, 0, y * std.math.log2(x)); },  // FYL2X
-                5 => { fpuSet(s, 0, @rem(fpuGet(s, 0), fpuGet(s, 1))); s.fpu_status_word &= ~@as(u16, 0x0400); },  // FPREM1
-                6 => { s.fpu_top = (s.fpu_top -% 1) & 7; s.fpu_status_word = (s.fpu_status_word & ~@as(u16,0x3800)) | @as(u16, @truncate((s.fpu_top & 7) << 11)); },  // FDECSTP
-                7 => { s.fpu_top = (s.fpu_top +% 1) & 7; s.fpu_status_word = (s.fpu_status_word & ~@as(u16,0x3800)) | @as(u16, @truncate((s.fpu_top & 7) << 11)); },  // FINCSTP
-                else => {},
-            },
-            7 => switch (d.rm) {
-                0 => fpuSet(s, 0, @rem(fpuGet(s, 0), fpuGet(s, 1))),  // FPREM
-                2 => fpuSet(s, 0, @sqrt(fpuGet(s, 0))),  // FSQRT
-                3 => { const v = fpuGet(s, 0); fpuSet(s, 0, @sin(v)); fpuPush(s, @cos(v)); },  // FSINCOS
-                4 => fpuSet(s, 0, @round(fpuGet(s, 0))),  // FRNDINT
-                5 => { const sc: f64 = @floatFromInt(@as(i64, @intFromFloat(@trunc(fpuGet(s, 1))))); fpuSet(s, 0, fpuGet(s, 0) * std.math.exp2(sc)); },  // FSCALE
-                6 => fpuSet(s, 0, @sin(fpuGet(s, 0))),  // FSIN
-                7 => fpuSet(s, 0, @cos(fpuGet(s, 0))),  // FCOS
-                else => {},
-            },
-            else => {},
-        }
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        switch (d.reg) {
-            0 => fpuPush(s, readFloat(s, addr)),  // FLD m32
-            2 => writeFloat(s, addr, @floatCast(fpuGet(s, 0))),  // FST m32
-            3 => { writeFloat(s, addr, @floatCast(fpuGet(s, 0))); _ = fpuPop(s); },  // FSTP m32
-            4 => {},  // FLDENV NOP
-            5 => s.fpu_control_word = memRead16(s, addr),  // FLDCW
-            6 => {},  // FNSTENV NOP
-            7 => memWrite16(s, addr, s.fpu_control_word),  // FNSTCW
-            else => {},
-        }
-    }
-}
-fn opDA(s: *CpuState) void { // int32 ops / FCMOV
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        switch (d.reg) {
-            0 => { if (getFlag(s, CF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVB
-            1 => { if (getFlag(s, ZF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVE
-            2 => { if (getFlag(s, CF_BIT) or getFlag(s, ZF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVBE
-            3 => fpuSet(s, 0, fpuGet(s, d.rm)),  // FCMOVU
-            5 => if (d.rm == 1) { fpuCompare(s, fpuGet(s, 0), fpuGet(s, 1)); _ = fpuPop(s); _ = fpuPop(s); },  // FUCOMPP
-            else => {},
-        }
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        const val: f64 = @floatFromInt(memReadS32(s, addr)); const st0 = fpuGet(s, 0);
-        switch (d.reg) {
-            0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
-            4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
-            6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
-            else => {},
-        }
-    }
-}
-fn opDB(s: *CpuState) void { // FILD/FISTP int32, FCLEX/FINIT, FUCOMI
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        if (d.reg == 4) {
-            if (d.rm == 2) { s.fpu_status_word &= 0x7F00; }  // FCLEX
-            else if (d.rm == 3) { s.fpu_control_word = 0x037F; s.fpu_status_word = 0; s.fpu_tag_word = 0xFFFF; s.fpu_top = 0; }  // FINIT
-        } else if (d.reg == 5) fpuComi(s, fpuGet(s, 0), fpuGet(s, d.rm), false)  // FUCOMI
-        else if (d.reg == 6) fpuComi(s, fpuGet(s, 0), fpuGet(s, d.rm), false);  // FCOMI
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        switch (d.reg) {
-            0 => fpuPush(s, @floatFromInt(memReadS32(s, addr))),  // FILD m32
-            1 => { const i: i32 = @intFromFloat(@trunc(fpuGet(s, 0))); memWrite32(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTTP
-            2 => { const i: i32 = @intFromFloat(@round(fpuGet(s, 0))); memWrite32(s, addr, @bitCast(i)); },  // FIST
-            3 => { const i: i32 = @intFromFloat(@round(fpuGet(s, 0))); memWrite32(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTP
-            5 => { // FLD m80real (simplified)
-                const lo = memRead32(s, addr); const hi = memRead32(s, addr + 4); const exp = memRead16(s, addr + 8);
-                const sign: f64 = if ((exp & 0x8000) != 0) -1.0 else 1.0;
-                const e: i32 = @as(i32, exp & 0x7FFF) - 16383;
-                const mant: f64 = (@as(f64, @floatFromInt(@as(u64, hi))) * 4294967296.0 + @as(f64, @floatFromInt(lo))) / 9223372036854775808.0;
-                if (e == -16383 and lo == 0 and hi == 0) fpuPush(s, sign * 0.0)
-                else fpuPush(s, sign * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(e))) * mant);
-            },
-            7 => { writeDouble(s, addr, fpuGet(s, 0)); memWrite16(s, addr + 8, 0); _ = fpuPop(s); },  // FSTP m80
-            else => {},
-        }
-    }
-}
-fn opDC(s: *CpuState) void { // float64 ops (reversed)
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        const st0 = fpuGet(s, 0); const sti = fpuGet(s, d.rm);
-        switch (d.reg) {
-            0 => fpuSet(s, d.rm, sti + st0), 1 => fpuSet(s, d.rm, sti * st0),
-            2 => fpuCompare(s, st0, sti), 3 => { fpuCompare(s, st0, sti); _ = fpuPop(s); },
-            4 => fpuSet(s, d.rm, sti - st0), 5 => fpuSet(s, d.rm, st0 - sti),
-            6 => fpuSet(s, d.rm, sti / st0), 7 => fpuSet(s, d.rm, st0 / sti),
-            else => {},
-        }
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        const val = readDouble(s, addr); const st0 = fpuGet(s, 0);
-        switch (d.reg) {
-            0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
-            4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
-            6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
-            else => {},
-        }
-    }
-}
-fn opDD(s: *CpuState) void { // FLD/FST/FSTP float64, FUCOM
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        switch (d.reg) {
-            0 => { const idx = ((@as(u8, @truncate(s.fpu_top)) +% d.rm) & 7); s.fpu_tag_word |= @as(u16, 3) << (@as(u4, @truncate(idx)) * 2); },  // FFREE
-            2 => fpuSet(s, d.rm, fpuGet(s, 0)),  // FST
-            3 => { fpuSet(s, d.rm, fpuGet(s, 0)); _ = fpuPop(s); },  // FSTP
-            4 => fpuCompare(s, fpuGet(s, 0), fpuGet(s, d.rm)),  // FUCOM
-            5 => { fpuCompare(s, fpuGet(s, 0), fpuGet(s, d.rm)); _ = fpuPop(s); },  // FUCOMP
-            else => {},
-        }
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        switch (d.reg) {
-            0 => fpuPush(s, readDouble(s, addr)),  // FLD m64
-            1 => { writeDouble(s, addr, @trunc(fpuGet(s, 0))); _ = fpuPop(s); },  // FISTTP m64
-            2 => writeDouble(s, addr, fpuGet(s, 0)),  // FST m64
-            3 => { writeDouble(s, addr, fpuGet(s, 0)); _ = fpuPop(s); },  // FSTP m64
-            4, 6 => {},  // FRSTOR/FNSAVE NOP
-            7 => memWrite16(s, addr, s.fpu_status_word),  // FNSTSW m16
-            else => {},
-        }
-    }
-}
-fn opDE(s: *CpuState) void { // FADDP/FMULP/etc / int16
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        const st0 = fpuGet(s, 0); const sti = fpuGet(s, d.rm);
-        switch (d.reg) {
-            0 => { fpuSet(s, d.rm, sti + st0); _ = fpuPop(s); },  // FADDP
-            1 => { fpuSet(s, d.rm, sti * st0); _ = fpuPop(s); },  // FMULP
-            2 => { fpuCompare(s, st0, sti); _ = fpuPop(s); },
-            3 => if (d.rm == 1) { fpuCompare(s, st0, fpuGet(s, 1)); _ = fpuPop(s); _ = fpuPop(s); },  // FCOMPP
-            4 => { fpuSet(s, d.rm, st0 - sti); _ = fpuPop(s); },  // FSUBRP
-            5 => { fpuSet(s, d.rm, sti - st0); _ = fpuPop(s); },  // FSUBP
-            6 => { fpuSet(s, d.rm, st0 / sti); _ = fpuPop(s); },  // FDIVRP
-            7 => { fpuSet(s, d.rm, sti / st0); _ = fpuPop(s); },  // FDIVP
-            else => {},
-        }
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        const raw = memRead16(s, addr); const val: f64 = @floatFromInt(@as(i16, @bitCast(raw)));
-        const st0 = fpuGet(s, 0);
-        switch (d.reg) {
-            0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
-            4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
-            6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
-            else => {},
-        }
-    }
-}
-fn opDF(s: *CpuState) void { // FILD/FISTP int16/int64, FNSTSW AX, FUCOMIP
-    const d = decodeModRM(s);
-    if (d.mod == 3) {
-        if (d.reg == 4 and d.rm == 0) {  // FNSTSW AX
-            s.regs[EAX] = (s.regs[EAX] & 0xFFFF0000) | @as(u32, s.fpu_status_word);
-        } else if (d.reg == 5) fpuComi(s, fpuGet(s, 0), fpuGet(s, d.rm), true)   // FUCOMIP
-        else if (d.reg == 6) fpuComi(s, fpuGet(s, 0), fpuGet(s, d.rm), true);   // FCOMIP
-    } else {
-        const r = resolveRm(s, d.mod, d.rm); const addr = applySegOvr(s, r.addr);
-        switch (d.reg) {
-            0 => { const raw = memRead16(s, addr); fpuPush(s, @floatFromInt(@as(i16, @bitCast(raw)))); },  // FILD m16
-            1 => { const i: i16 = @intFromFloat(@trunc(fpuGet(s, 0))); memWrite16(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTTP m16
-            2 => { const i: i16 = @intFromFloat(@round(fpuGet(s, 0))); memWrite16(s, addr, @bitCast(i)); },  // FIST m16
-            3 => { const i: i16 = @intFromFloat(@round(fpuGet(s, 0))); memWrite16(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTP m16
-            5 => { const lo = memRead32(s, addr); const hi: i32 = memReadS32(s, addr + 4); fpuPush(s, @as(f64, @floatFromInt(@as(i64, hi) * 0x100000000 + @as(i64, lo)))); },  // FILD m64
-            7 => { const val = fpuGet(s, 0); const iv: i64 = @intFromFloat(@trunc(val)); const bits: u64 = @bitCast(iv); memWrite32(s, addr, @truncate(bits)); memWrite32(s, addr + 4, @truncate(bits >> 32)); _ = fpuPop(s); },  // FISTP m64
-            else => {},
-        }
-    }
-}
-
 // ─── Dispatch table ───────────────────────────────────────────────────────────
 const dispatch_table: [256]OpFn = dt: {
     @setEvalBranchQuota(20000);
     var t = [_]OpFn{opFault} ** 256;
     t[0x00] = op00; t[0x01] = op01; t[0x02] = op02; t[0x03] = op03; t[0x04] = op04; t[0x05] = op05;
     t[0x06] = op06; t[0x07] = op07; t[0x08] = op08; t[0x09] = op09; t[0x0A] = op0A; t[0x0B] = op0B;
-    t[0x0C] = op0C; t[0x0D] = op0D; t[0x0E] = op0E; t[0x0F] = op0F;
+    t[0x0C] = op0C; t[0x0D] = op0D; t[0x0E] = op0E; t[0x0F] = two_byte.op0F;
     t[0x10] = op10; t[0x11] = op11; t[0x12] = op12; t[0x13] = op13; t[0x14] = op14; t[0x15] = op15;
     t[0x16] = op16; t[0x17] = op17; t[0x18] = op18; t[0x19] = op19; t[0x1A] = op1A; t[0x1B] = op1B;
     t[0x1C] = op1C; t[0x1D] = op1D; t[0x1E] = op1E; t[0x1F] = op1F;
@@ -1777,8 +1139,8 @@ const dispatch_table: [256]OpFn = dt: {
     t[0xC0] = opC0; t[0xC1] = opC1; t[0xC2] = opC2; t[0xC3] = opC3; t[0xC4] = opC4; t[0xC5] = opC5;
     t[0xC6] = opC6; t[0xC7] = opC7; t[0xC8] = opC8; t[0xC9] = opC9; t[0xCC] = opCC; t[0xCD] = opCD;
     t[0xD1] = opD1; t[0xD2] = opD2; t[0xD3] = opD3;
-    t[0xD8] = opD8; t[0xD9] = opD9; t[0xDA] = opDA; t[0xDB] = opDB;
-    t[0xDC] = opDC; t[0xDD] = opDD; t[0xDE] = opDE; t[0xDF] = opDF;
+    t[0xD8] = fpu.opD8; t[0xD9] = fpu.opD9; t[0xDA] = fpu.opDA; t[0xDB] = fpu.opDB;
+    t[0xDC] = fpu.opDC; t[0xDD] = fpu.opDD; t[0xDE] = fpu.opDE; t[0xDF] = fpu.opDF;
     t[0xE0] = opE0; t[0xE1] = opE1; t[0xE2] = opE2; t[0xE3] = opE3;
     t[0xE8] = opE8; t[0xE9] = opE9; t[0xEB] = opEB;
     t[0xF4] = opF4; t[0xF5] = opF5; t[0xF6] = opF6; t[0xF7] = opF7;
@@ -1838,8 +1200,9 @@ export fn cpu_set_fs_base(s: *CpuState, val: u32) void { s.fs_base = val; }
 export fn cpu_set_gs_base(s: *CpuState, val: u32) void { s.gs_base = val; }
 export fn cpu_get_fs_base(s: *CpuState) u32 { return s.fs_base; }
 export fn cpu_get_gs_base(s: *CpuState) u32 { return s.gs_base; }
-export fn cpu_fpu_get(s: *CpuState, i: u32) f64 { return if (i < 8) s.fpu_stack[i] else 0.0; }
-export fn cpu_fpu_set(s: *CpuState, i: u32, val: f64) void { if (i < 8) s.fpu_stack[i] = val; }
+// fpu_stack is f80 — narrow to f64 for the C API.
+export fn cpu_fpu_get(s: *CpuState, i: u32) f64 { return if (i < 8) @floatCast(s.fpu_stack[i]) else 0.0; }
+export fn cpu_fpu_set(s: *CpuState, i: u32, val: f64) void { if (i < 8) s.fpu_stack[i] = @floatCast(val); }
 export fn cpu_fpu_get_top(s: *CpuState) u32 { return s.fpu_top; }
 export fn cpu_fpu_set_top(s: *CpuState, val: u32) void { s.fpu_top = val & 7; }
 export fn cpu_fpu_get_status(s: *CpuState) u16 { return s.fpu_status_word; }
@@ -1874,7 +1237,7 @@ test "HLT stops execution" {
 }
 
 test "ADD EAX imm32" {
-    var mem = [_]u8{0x05, 0x05, 0x00, 0x00, 0x00} ++ [_]u8{0} ** 59; // ADD EAX, 5
+    var mem = [_]u8{0x05, 0x05, 0x00, 0x00, 0x00} ++ [_]u8{0} ** 59;
     var s = CpuState{ .memory = &mem, .memory_size = mem.len };
     s.regs[EAX] = 10;
     cpuStep(&s);
@@ -1886,16 +1249,16 @@ test "PUSH/POP round-trip" {
     var cs = CpuState{ .memory = &combined, .memory_size = combined.len };
     cs.regs[EAX] = 0xDEADBEEF;
     cs.regs[ESP] = 0x200;
-    cpuStep(&cs); // PUSH EAX
+    cpuStep(&cs);
     try testing.expectEqual(@as(u32, 0x1FC), cs.regs[ESP]);
-    cs.regs[EAX] = 0; // clobber
-    cpuStep(&cs); // POP EAX
+    cs.regs[EAX] = 0;
+    cpuStep(&cs);
     try testing.expectEqual(@as(u32, 0xDEADBEEF), cs.regs[EAX]);
     try testing.expectEqual(@as(u32, 0x200), cs.regs[ESP]);
 }
 
 test "XOR EAX, EAX zeroes register" {
-    var mem = [_]u8{0x33, 0xC0} ++ [_]u8{0} ** 62; // XOR EAX, EAX
+    var mem = [_]u8{0x33, 0xC0} ++ [_]u8{0} ** 62;
     var s = CpuState{ .memory = &mem, .memory_size = mem.len };
     s.regs[EAX] = 0x12345678;
     cpuStep(&s);
