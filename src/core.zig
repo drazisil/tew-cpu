@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // core.zig — CpuState definition and all shared helpers.
 // Imported by every opcode module; no imports from our own modules here.
 const std = @import("std");
@@ -32,6 +33,7 @@ pub const REP_REPNE: u8 = 2;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 pub const IntHandlerFn = *const fn (state: *anyopaque, int_num: u8) callconv(.C) void;
+pub const LogpointFn  = *const fn (eip: u32, regs: [*]u32, memory: [*]u8, memory_size: usize) callconv(.C) void;
 pub const OpFn = *const fn (*CpuState) void;
 
 pub const RunResult = enum(c_int) {
@@ -69,6 +71,13 @@ pub const CpuState = struct {
     watchpoint_eip: u32 = 0,
     watchpoint_val: u32 = 0,
     watchpoint_hit: bool = false,
+    // EIP breakpoints (halt): up to 8 slots; 0 = empty.
+    bp_table:   [8]u32 = .{0} ** 8,
+    bp_hit:     bool   = false,
+    bp_hit_eip: u32    = 0,
+    // EIP logpoints (fire C callback inline, no halt): up to 8 slots.
+    lp_eip:  [8]u32     = .{0} ** 8,
+    lp_cb:   [8]?LogpointFn = .{null} ** 8,
 };
 
 // ─── Internal helper structs ─────────────────────────────────────────────────

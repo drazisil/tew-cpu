@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // cpu.zig — One-byte opcode handlers, dispatch table, execution engine, C API.
 // Shared types/helpers live in core.zig. FPU ops in fpu.zig. 0x0F ops in two_byte.zig.
 const std = @import("std");
@@ -1179,7 +1180,26 @@ export fn cpu_destroy(s: *CpuState) void { std.heap.c_allocator.destroy(s); }
 export fn cpu_set_int_handler(s: *CpuState, handler: IntHandlerFn) void { s.int_handler = handler; }
 export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
     var i: u64 = 0;
-    while (!s.halted and i < max_steps) : (i += 1) cpuStep(s);
+    while (!s.halted and i < max_steps) : (i += 1) {
+        const eip = s.eip;
+        // Logpoints: fire inline C callback, no halt.
+        for (0..8) |j| {
+            if (s.lp_eip[j] != 0 and eip == s.lp_eip[j]) {
+                if (s.lp_cb[j]) |cb| cb(eip, &s.regs, s.memory, s.memory_size);
+            }
+        }
+        // Breakpoints: halt before executing the instruction.
+        for (s.bp_table) |bp| {
+            if (bp != 0 and eip == bp) {
+                s.bp_hit = true;
+                s.bp_hit_eip = eip;
+                s.halted = true;
+                break;
+            }
+        }
+        if (s.halted) break;
+        cpuStep(s);
+    }
     if (s.faulted) return .faulted;
     if (s.halted) return .halted;
     return .step_limit;
@@ -1216,6 +1236,35 @@ export fn cpu_clear_watchpoint(s: *CpuState) void { s.watchpoint = 0; s.watchpoi
 export fn cpu_watchpoint_hit(s: *CpuState) bool { return s.watchpoint_hit; }
 export fn cpu_watchpoint_eip(s: *CpuState) u32 { return s.watchpoint_eip; }
 export fn cpu_watchpoint_val(s: *CpuState) u32 { return s.watchpoint_val; }
+
+// ─── Breakpoints (halt-type) ─────────────────────────────────────────────────
+export fn cpu_add_breakpoint(s: *CpuState, eip: u32) void {
+    for (&s.bp_table) |*slot| { if (slot.* == 0) { slot.* = eip; return; } }
+}
+export fn cpu_remove_breakpoint(s: *CpuState, eip: u32) void {
+    for (&s.bp_table) |*slot| { if (slot.* == eip) slot.* = 0; }
+}
+export fn cpu_clear_breakpoints(s: *CpuState) void {
+    s.bp_table = .{0} ** 8; s.bp_hit = false; s.bp_hit_eip = 0;
+}
+export fn cpu_breakpoint_hit(s: *CpuState) bool { return s.bp_hit; }
+export fn cpu_breakpoint_hit_eip(s: *CpuState) u32 { return s.bp_hit_eip; }
+export fn cpu_clear_breakpoint_hit(s: *CpuState) void {
+    s.bp_hit = false; s.halted = false; s.faulted = false;
+}
+
+// ─── Logpoints (inline callback, no halt) ───────────────────────────────────
+export fn cpu_add_logpoint(s: *CpuState, eip: u32, cb: core.LogpointFn) void {
+    for (0..8) |j| {
+        if (s.lp_eip[j] == 0) { s.lp_eip[j] = eip; s.lp_cb[j] = cb; return; }
+    }
+}
+export fn cpu_remove_logpoint(s: *CpuState, eip: u32) void {
+    for (0..8) |j| { if (s.lp_eip[j] == eip) { s.lp_eip[j] = 0; s.lp_cb[j] = null; } }
+}
+export fn cpu_clear_logpoints(s: *CpuState) void {
+    s.lp_eip = .{0} ** 8; s.lp_cb = .{null} ** 8;
+}
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 const testing = std.testing;

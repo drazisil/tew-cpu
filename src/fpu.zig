@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // fpu.zig — x87 FPU helpers and opcode handlers (D8–DF).
 //
 // The FPU stack is [8]f80 (80-bit extended precision).  This is intentional:

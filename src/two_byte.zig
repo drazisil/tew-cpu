@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // two_byte.zig — 0x0F-prefixed opcode handler (op0F).
 // Imported by cpu.zig; imports mmx.zig for MMX instructions.
 const std = @import("std");

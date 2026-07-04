@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // mmx.zig — MMX instruction handlers (MOVQ, EMMS).
 // Called from two_byte.zig for 0x0F-prefixed opcodes 6F, 7F, 77.
 const core = @import("core.zig");
