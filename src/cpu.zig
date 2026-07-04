@@ -7,7 +7,13 @@ const fpu = @import("fpu.zig");
 const two_byte = @import("two_byte.zig");
 
 // ─── Type and constant aliases from core ────────────────────────────────────
-const CpuState = core.CpuState;
+// CpuState/RunResult are `pub` -- unlike the rest of these aliases -- so an
+// external Zig consumer that @imports this file as a module (e.g.
+// pe-walker's emulator.zig, vendoring this source rather than linking a
+// compiled library) can reference them directly, the same way cpu_run below
+// is `pub export fn` rather than just `export fn`.
+pub const CpuState = core.CpuState;
+pub const RunResult = core.RunResult;
 const EAX = core.EAX; const ECX = core.ECX; const EDX = core.EDX; const EBX = core.EBX;
 const ESP = core.ESP; const EBP = core.EBP; const ESI = core.ESI; const EDI = core.EDI;
 const CF_BIT = core.CF_BIT; const PF_BIT = core.PF_BIT; const ZF_BIT = core.ZF_BIT;
@@ -16,7 +22,6 @@ const SEG_NONE = core.SEG_NONE; const SEG_FS = core.SEG_FS; const SEG_GS = core.
 const REP_NONE = core.REP_NONE; const REP_REP = core.REP_REP; const REP_REPNE = core.REP_REPNE;
 const IntHandlerFn = core.IntHandlerFn;
 const OpFn = core.OpFn;
-const RunResult = core.RunResult;
 const RmInfo = core.RmInfo;
 const Rm8Result = core.Rm8Result;
 const Rm32Result = core.Rm32Result;
@@ -1178,7 +1183,7 @@ export fn cpu_create(memory: [*]u8, memory_size: usize) ?*CpuState {
 }
 export fn cpu_destroy(s: *CpuState) void { std.heap.c_allocator.destroy(s); }
 export fn cpu_set_int_handler(s: *CpuState, handler: IntHandlerFn) void { s.int_handler = handler; }
-export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
+pub export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
     var i: u64 = 0;
     while (!s.halted and i < max_steps) : (i += 1) {
         const eip = s.eip;
