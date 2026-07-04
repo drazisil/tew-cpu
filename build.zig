@@ -1,25 +1,38 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // The installed Zig toolchain (zig-x86-linux-0.15.2) is itself a 32-bit
+    // x86 build, so its "native" default resolves to i386 -- even though the
+    // host kernel is x86_64. Default to x86_64-linux-gnu explicitly;
+    // -Dtarget still overrides this if ever needed.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib = b.addSharedLibrary(.{
-        .name = "cpu",
+    const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/cpu.zig"),
         .target = target,
         .optimize = optimize,
-        .version = .{ .major = 0, .minor = 1, .patch = 0 },
     });
-    lib.linkLibC();
+    lib_mod.link_libc = true;
+
+    const lib = b.addLibrary(.{
+        .name = "cpu",
+        .root_module = lib_mod,
+        .linkage = .dynamic,
+        .version = .{ .major = 0, .minor = 2, .patch = 0 },
+    });
     b.installArtifact(lib);
 
-    const tests = b.addTest(.{
+    const test_mod = b.createModule(.{
         .root_source_file = b.path("src/cpu.zig"),
         .target = target,
         .optimize = optimize,
     });
-    tests.linkLibC();
+    test_mod.link_libc = true;
+
+    const tests = b.addTest(.{ .root_module = test_mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

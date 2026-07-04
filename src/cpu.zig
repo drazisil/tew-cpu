@@ -1314,3 +1314,44 @@ test "XOR EAX, EAX zeroes register" {
     try testing.expectEqual(@as(u32, 0), s.regs[EAX]);
     try testing.expect(getFlag(&s, ZF_BIT));
 }
+
+// ─── Public C ABI tests ───────────────────────────────────────────────────────
+// The tests above all call the internal cpuStep() directly -- real proof the
+// core logic needs no Python/ctypes, but not proof the *exported* cpu_* C ABI
+// itself works standalone. These three exercise only cpu_create/cpu_run/
+// cpu_get_reg/cpu_destroy/cpu_add_breakpoint/cpu_breakpoint_hit/cpu_set_eip --
+// the same surface any external consumer (e.g. pe-walker, over direct Zig
+// @import rather than a C ABI at all, or the Python harness over ctypes)
+// would use.
+
+test "public C ABI: cpu_create/run/get_reg/destroy round-trip" {
+    var mem = [_]u8{ 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xF4 } ++ [_]u8{0} ** 58; // mov eax,0x2a; hlt
+    const s = cpu_create(&mem, mem.len).?;
+    defer cpu_destroy(s);
+    const result = cpu_run(s, 100);
+    try testing.expectEqual(RunResult.halted, result);
+    try testing.expectEqual(@as(u32, 0x2a), cpu_get_reg(s, EAX));
+    try testing.expect(!cpu_is_faulted(s));
+}
+
+test "public C ABI: breakpoint halts before executing, not after" {
+    var mem = [_]u8{ 0x90, 0x90, 0xF4 } ++ [_]u8{0} ** 61; // nop; nop; hlt
+    const s = cpu_create(&mem, mem.len).?;
+    defer cpu_destroy(s);
+    cpu_add_breakpoint(s, 2); // address of the hlt
+    const result = cpu_run(s, 100);
+    try testing.expectEqual(RunResult.halted, result);
+    try testing.expect(cpu_breakpoint_hit(s));
+    try testing.expectEqual(@as(u32, 2), cpu_breakpoint_hit_eip(s));
+    try testing.expectEqual(@as(u32, 2), cpu_get_eip(s)); // hlt NOT yet executed
+}
+
+test "public C ABI: out-of-bounds fetch faults, not crashes" {
+    var mem = [_]u8{ 0x90, 0x90 };
+    const s = cpu_create(&mem, mem.len).?;
+    defer cpu_destroy(s);
+    cpu_set_eip(s, 10); // well past memory_size
+    const result = cpu_run(s, 10);
+    try testing.expectEqual(RunResult.faulted, result);
+    try testing.expect(cpu_is_faulted(s));
+}

@@ -32,8 +32,8 @@ pub const REP_REP: u8 = 1;
 pub const REP_REPNE: u8 = 2;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
-pub const IntHandlerFn = *const fn (state: *anyopaque, int_num: u8) callconv(.C) void;
-pub const LogpointFn  = *const fn (eip: u32, regs: [*]u32, memory: [*]u8, memory_size: usize) callconv(.C) void;
+pub const IntHandlerFn = *const fn (state: *anyopaque, int_num: u8) callconv(.c) void;
+pub const LogpointFn  = *const fn (eip: u32, regs: [*]u32, memory: [*]u8, memory_size: usize) callconv(.c) void;
 pub const OpFn = *const fn (*CpuState) void;
 
 pub const RunResult = enum(c_int) {
