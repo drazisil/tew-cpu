@@ -1244,6 +1244,7 @@ export fn cpu_is_faulted(s: *CpuState) bool { return s.faulted; }
 export fn cpu_set_halted(s: *CpuState) void { s.halted = true; }
 export fn cpu_clear_halted(s: *CpuState) void { s.halted = false; s.faulted = false; }
 export fn cpu_get_step_count(s: *CpuState) u64 { return s.step_count; }
+export fn cpu_get_run_id(s: *CpuState) u64 { return s.run_id; }
 export fn cpu_get_last_opcode(s: *CpuState) u8 { return s.last_opcode; }
 export fn cpu_set_fs_base(s: *CpuState, val: u32) void { s.fs_base = val; }
 export fn cpu_set_gs_base(s: *CpuState, val: u32) void { s.gs_base = val; }
