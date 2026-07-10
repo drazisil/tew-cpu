@@ -14,6 +14,8 @@ const two_byte = @import("two_byte.zig");
 // is `pub export fn` rather than just `export fn`.
 pub const CpuState = core.CpuState;
 pub const RunResult = core.RunResult;
+pub const WriteHookFn = core.WriteHookFn;
+pub const StepHookFn = core.StepHookFn;
 const EAX = core.EAX; const ECX = core.ECX; const EDX = core.EDX; const EBX = core.EBX;
 const ESP = core.ESP; const EBP = core.EBP; const ESI = core.ESI; const EDI = core.EDI;
 const CF_BIT = core.CF_BIT; const PF_BIT = core.PF_BIT; const ZF_BIT = core.ZF_BIT;
@@ -1179,6 +1181,17 @@ fn cpuStep(s: *CpuState) void {
 export fn cpu_create(memory: [*]u8, memory_size: usize) ?*CpuState {
     const s = std.heap.c_allocator.create(CpuState) catch return null;
     s.* = CpuState{ .memory = memory, .memory_size = memory_size };
+    // run_id: the core's own native notion of "a new session" is the birth
+    // of a fresh CpuState -- see history/capture.zig. Deliberately NOT
+    // std.crypto.random here: confirmed via Valgrind that its thread-local
+    // CSPRNG state (crypto.tlcsprng) segfaults (NULL-pointer write inside
+    // fillWithCsprng) on the second call when this library is loaded into
+    // a foreign host process and invoked repeatedly via ctypes/libffi
+    // (Python, in this codebase's case) -- it doesn't reliably survive
+    // being called from a thread Zig's own runtime didn't start. run_id
+    // only needs to be unique per session, not unpredictable, so mix a
+    // timestamp with this CpuState's own fresh heap address instead.
+    s.run_id = @as(u64, @bitCast(std.time.milliTimestamp())) ^ @intFromPtr(s);
     return s;
 }
 export fn cpu_destroy(s: *CpuState) void { std.heap.c_allocator.destroy(s); }
@@ -1203,7 +1216,18 @@ pub export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
             }
         }
         if (s.halted) break;
+        // step_no captured pre-increment, before cpuStep runs -- matches
+        // what memWrite8 sees via s.step_count during this same
+        // instruction's dispatch (cpuStep only increments step_count
+        // after dispatch completes). Fires once per successfully-
+        // dispatched instruction using post-execution state, regardless
+        // of max_steps -- correct even if a caller runs cpu_run with a
+        // count greater than 1.
+        const step_no = s.step_count;
         cpuStep(s);
+        if (!s.faulted) {
+            if (s.step_hook) |hook| hook(s.history_ctx, s.run_id, step_no, s.eip, &s.regs, s.eflags);
+        }
     }
     if (s.faulted) return .faulted;
     if (s.halted) return .halted;
@@ -1269,6 +1293,68 @@ export fn cpu_remove_logpoint(s: *CpuState, eip: u32) void {
 }
 export fn cpu_clear_logpoints(s: *CpuState) void {
     s.lp_eip = .{0} ** 8; s.lp_cb = .{null} ** 8;
+}
+
+// ─── Execution-history capture (see history/capture.zig) ───────────────────
+const history_capture = @import("history/capture.zig");
+pub const Capture = history_capture.Capture;
+
+/// Wires a discard-sink Capture onto `s` -- exercises the full capture path
+/// (buffering, batching, event shape) without sending anything anywhere.
+/// Useful for wiring/smoke tests before a real ClickHouse endpoint exists.
+/// Returns an opaque handle; caller must pass it to cpu_history_disable to
+/// flush + free it.
+export fn cpu_history_enable_discard(s: *CpuState) ?*Capture {
+    const cap = std.heap.c_allocator.create(Capture) catch return null;
+    cap.* = Capture.init(std.heap.c_allocator, .none);
+    cap.armFor(s);
+    s.history_ctx = cap;
+    s.write_hook = history_capture.onCpuWrite;
+    s.step_hook = history_capture.onCpuStep;
+    return cap;
+}
+
+/// Wires a real ClickHouse-flushing Capture onto `s`. base_url/user/password
+/// are copied (duped with the C allocator) since ctypes-supplied strings
+/// aren't guaranteed to outlive this call.
+export fn cpu_history_enable_clickhouse(
+    s: *CpuState,
+    base_url: [*:0]const u8,
+    user: [*:0]const u8,
+    password: [*:0]const u8,
+) ?*Capture {
+    const url_copy = std.heap.c_allocator.dupeZ(u8, std.mem.span(base_url)) catch return null;
+    const user_copy = std.heap.c_allocator.dupeZ(u8, std.mem.span(user)) catch return null;
+    const pass_copy = std.heap.c_allocator.dupeZ(u8, std.mem.span(password)) catch return null;
+    const cap = std.heap.c_allocator.create(Capture) catch return null;
+    cap.* = Capture.init(std.heap.c_allocator, .{ .clickhouse = .{
+        .allocator = std.heap.c_allocator,
+        .base_url = url_copy,
+        .user = user_copy,
+        .password = pass_copy,
+    } });
+    cap.armFor(s);
+    s.history_ctx = cap;
+    s.write_hook = history_capture.onCpuWrite;
+    s.step_hook = history_capture.onCpuStep;
+    return cap;
+}
+
+/// Forces a flush now, without waiting for flush_threshold or disable --
+/// e.g. from Python at the end of a run/on halt, so the tail of a capture
+/// isn't lost.
+export fn cpu_history_flush(cap: *Capture) void {
+    cap.flush();
+}
+
+/// Unwires the hooks from `s`, flushes any remaining buffered events, and
+/// frees the Capture. `s` itself is untouched otherwise and remains usable.
+export fn cpu_history_disable(s: *CpuState, cap: *Capture) void {
+    s.history_ctx = null;
+    s.write_hook = null;
+    s.step_hook = null;
+    cap.deinit();
+    std.heap.c_allocator.destroy(cap);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

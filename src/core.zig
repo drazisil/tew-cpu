@@ -35,6 +35,16 @@ pub const REP_REPNE: u8 = 2;
 pub const IntHandlerFn = *const fn (state: *anyopaque, int_num: u8) callconv(.c) void;
 pub const LogpointFn  = *const fn (eip: u32, regs: [*]u32, memory: [*]u8, memory_size: usize) callconv(.c) void;
 pub const OpFn = *const fn (*CpuState) void;
+// Execution-history capture hooks (ported from pe-walker's vendored copy --
+// see history/capture.zig). Both are pure observation: void-returning, and
+// never touch s.halted/s.faulted/the value being written, unlike the
+// watchpoint mechanism below. write_hook fires once per real, in-bounds,
+// value-changing memory write (see memWrite8). step_hook fires once per
+// successfully-dispatched instruction, from inside cpu_run's own loop, so
+// it stays correct regardless of how many instructions a single cpu_run
+// call executes.
+pub const WriteHookFn = *const fn (ctx: ?*anyopaque, run_id: u64, step: u64, addr: u32, old: u8, new: u8) callconv(.c) void;
+pub const StepHookFn = *const fn (ctx: ?*anyopaque, run_id: u64, step: u64, eip: u32, regs: *const [8]u32, eflags: u32) callconv(.c) void;
 
 pub const RunResult = enum(c_int) {
     ok = 0,
@@ -78,6 +88,14 @@ pub const CpuState = struct {
     // EIP logpoints (fire C callback inline, no halt): up to 8 slots.
     lp_eip:  [8]u32     = .{0} ** 8,
     lp_cb:   [8]?LogpointFn = .{null} ** 8,
+    // Execution-history capture (ported from pe-walker's vendored copy --
+    // see history/capture.zig). run_id is set once, by cpu_create, at
+    // CpuState construction time -- the core's own native notion of "a new
+    // session" is the birth of a fresh CpuState.
+    run_id: u64 = 0,
+    history_ctx: ?*anyopaque = null,   // shared by both hooks below
+    write_hook: ?WriteHookFn = null,
+    step_hook: ?StepHookFn = null,
 };
 
 // ─── Internal helper structs ─────────────────────────────────────────────────
@@ -107,6 +125,12 @@ pub inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
         s.watchpoint_hit = true;
         s.memory[addr] = v;
         s.halted = true;
+        return;
+    }
+    if (s.write_hook) |hook| {
+        const old = s.memory[addr];
+        s.memory[addr] = v;
+        if (old != v) hook(s.history_ctx, s.run_id, s.step_count, addr, old, v);
         return;
     }
     s.memory[addr] = v;
