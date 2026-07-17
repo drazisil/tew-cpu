@@ -442,12 +442,12 @@ fn op80(s: *CpuState) void { // Group 1 byte: op rm8, imm8
     const imm = fetch8(s); const op1 = res.value;
     switch (d.reg) {
         0 => { const r = op1 +% imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsArith(s, @as(i64,op1)+@as(i64,imm), op1, imm, false); },
-        1 => { const r = op1 | imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r); },
+        1 => { const r = op1 | imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r); },
         2 => { const c: u8 = if(getFlag(s,CF_BIT)) 1 else 0; const r = op1+%imm+%c; writeRm8Resolved(s,res.is_reg,res.addr,r); updateFlagsArith(s,@as(i64,op1)+@as(i64,imm)+@as(i64,c),op1,imm+%c,false); },
         3 => { const b: u8 = if(getFlag(s,CF_BIT)) 1 else 0; const r = op1-%imm-%b; writeRm8Resolved(s,res.is_reg,res.addr,r); updateFlagsArith(s,@as(i64,op1)-@as(i64,imm)-@as(i64,b),op1,imm+%b,true); },
-        4 => { const r = op1 & imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r); },
+        4 => { const r = op1 & imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r); },
         5 => { const r = op1 -% imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsArith(s, @as(i64,op1)-@as(i64,imm), op1, imm, true); },
-        6 => { const r = op1 ^ imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r); },
+        6 => { const r = op1 ^ imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r); },
         7 => updateFlagsArith(s, @as(i64,op1)-@as(i64,imm), op1, imm, true),
         else => {},
     }
@@ -475,7 +475,8 @@ fn op99(s: *CpuState) void { // CDQ
     s.regs[EDX] = if ((s.regs[EAX] & 0x80000000) != 0) 0xFFFFFFFF else 0;
 }
 fn opA8(s: *CpuState) void { // TEST AL, imm8
-    const imm = fetch8(s); updateFlagsLogic(s, @as(u32, s.regs[EAX] & 0xFF & imm));
+    const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
+    updateFlagsLogic8(s, al & imm);
 }
 fn opA9(s: *CpuState) void { // TEST EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); updateFlagsLogic(s, a & imm);
@@ -523,7 +524,7 @@ fn opD3(s: *CpuState) void { // Group 2: shift rmv, CL
 fn opF6(s: *CpuState) void { // Group 3 byte
     const d = decodeModRM(s); const val = readRm8(s, d.mod, d.rm);
     switch (d.reg) {
-        0 => updateFlagsLogic(s, @as(u32, val & fetch8(s))),
+        0 => updateFlagsLogic8(s, val & fetch8(s)),
         2 => writeRm8(s, d.mod, d.rm, ~val),
         3 => {
             const r = (0 -% @as(u32, val)) & 0xFF;
@@ -656,7 +657,7 @@ fn opF7(s: *CpuState) void { // Group 3 word/dword
 // ─── Logic opcodes ────────────────────────────────────────────────────────────
 fn op08(s: *CpuState) void { // OR rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
-    const r = res.value | readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r);
+    const r = res.value | readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r);
 }
 fn op09(s: *CpuState) void { // OR rmv, rv
     const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
@@ -664,7 +665,7 @@ fn op09(s: *CpuState) void { // OR rmv, rv
 }
 fn op0A(s: *CpuState) void { // OR r8, rm8
     const d = decodeModRM(s); const r = readReg8(s, d.reg) | readRm8(s, d.mod, d.rm);
-    writeReg8(s, d.reg, r); updateFlagsLogic(s, r);
+    writeReg8(s, d.reg, r); updateFlagsLogic8(s, r);
 }
 fn op0B(s: *CpuState) void { // OR r32, rm32
     const d = decodeModRM(s); const r = s.regs[d.reg] | readRm32(s, d.mod, d.rm);
@@ -672,7 +673,7 @@ fn op0B(s: *CpuState) void { // OR r32, rm32
 }
 fn op0C(s: *CpuState) void { // OR AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
-    const r = al | imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogic(s, r);
+    const r = al | imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogic8(s, r);
 }
 fn op0D(s: *CpuState) void { // OR EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); const r = a | imm;
@@ -680,7 +681,7 @@ fn op0D(s: *CpuState) void { // OR EAX/AX, immv
 }
 fn op20(s: *CpuState) void { // AND rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
-    const r = res.value & readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r);
+    const r = res.value & readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r);
 }
 fn op21(s: *CpuState) void { // AND rmv, rv
     const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
@@ -688,7 +689,7 @@ fn op21(s: *CpuState) void { // AND rmv, rv
 }
 fn op22(s: *CpuState) void { // AND r8, rm8
     const d = decodeModRM(s); const r = readReg8(s, d.reg) & readRm8(s, d.mod, d.rm);
-    writeReg8(s, d.reg, r); updateFlagsLogic(s, r);
+    writeReg8(s, d.reg, r); updateFlagsLogic8(s, r);
 }
 fn op23(s: *CpuState) void { // AND r32, rm32
     const d = decodeModRM(s); const r = s.regs[d.reg] & readRm32(s, d.mod, d.rm);
@@ -696,7 +697,7 @@ fn op23(s: *CpuState) void { // AND r32, rm32
 }
 fn op24(s: *CpuState) void { // AND AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
-    const r = al & imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogic(s, r);
+    const r = al & imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogic8(s, r);
 }
 fn op25(s: *CpuState) void { // AND EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); const r = a & imm;
@@ -704,7 +705,7 @@ fn op25(s: *CpuState) void { // AND EAX/AX, immv
 }
 fn op30(s: *CpuState) void { // XOR rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
-    const r = res.value ^ readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r);
+    const r = res.value ^ readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r);
 }
 fn op31(s: *CpuState) void { // XOR rmv, rv
     const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
@@ -712,7 +713,7 @@ fn op31(s: *CpuState) void { // XOR rmv, rv
 }
 fn op32(s: *CpuState) void { // XOR r8, rm8
     const d = decodeModRM(s); const r = readReg8(s, d.reg) ^ readRm8(s, d.mod, d.rm);
-    writeReg8(s, d.reg, r); updateFlagsLogic(s, r);
+    writeReg8(s, d.reg, r); updateFlagsLogic8(s, r);
 }
 fn op33(s: *CpuState) void { // XOR r32, rm32
     const d = decodeModRM(s); const r = s.regs[d.reg] ^ readRm32(s, d.mod, d.rm);
@@ -724,7 +725,7 @@ fn op35(s: *CpuState) void { // XOR EAX/AX, immv
 }
 fn op84(s: *CpuState) void { // TEST rm8, r8
     const d = decodeModRM(s);
-    updateFlagsLogic(s, @as(u32, readRm8(s, d.mod, d.rm) & readReg8(s, d.reg)));
+    updateFlagsLogic8(s, readRm8(s, d.mod, d.rm) & readReg8(s, d.reg));
 }
 fn op85(s: *CpuState) void { // TEST rmv, rv
     const d = decodeModRM(s); updateFlagsLogic(s, readRm32(s, d.mod, d.rm) & s.regs[d.reg]);
@@ -1405,6 +1406,84 @@ test "XOR EAX, EAX zeroes register" {
     cpuStep(&s);
     try testing.expectEqual(@as(u32, 0), s.regs[EAX]);
     try testing.expect(getFlag(&s, ZF_BIT));
+}
+
+// ─── 8-bit logic-op SF regression tests ───────────────────────────────────────
+// Found live: TEST AL,AL with AL=0xf8 (SHAPE_convertdepth's $f8 investigation,
+// tew-fake-kernel-gaps memory) reported SF=false, when bit 7 of 0xf8 is
+// clearly set. Root cause: op84/opA8/opF6-case0 (TEST) and the 8-bit OR/AND/
+// XOR opcodes (op08/0A/0C, op20/22/24, op30/32, and op80's byte-immediate
+// group1 cases 1/4/6) all called the 32-bit updateFlagsLogic() on a
+// zero-extended 8-bit result -- (result & 0x80000000) can never be true for
+// a byte 0x00-0xFF, so SF was always wrong whenever bit 7 of the real 8-bit
+// result was set. Fixed by routing all of them through updateFlagsLogic8()
+// (already existed, already used correctly by the 8-bit shift group) instead.
+// These tests exercise one opcode per mnemonic family, not all twelve call
+// sites -- the fix is mechanical/identical across all of them.
+
+test "TEST AL,AL sets SF when AL has bit 7 set (regression: was always false)" {
+    var mem = [_]u8{0x84, 0xC0} ++ [_]u8{0} ** 62; // test al,al
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x000000f8; // AL = 0xf8, the exact byte from the live bug
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(!getFlag(&s, ZF_BIT));
+    try testing.expectEqual(@as(u32, 0x000000f8), s.regs[EAX]); // TEST never writes back
+}
+
+test "TEST AL,imm8 sets SF when the masked result has bit 7 set" {
+    var mem = [_]u8{0xA8, 0xFF} ++ [_]u8{0} ** 62; // test al,0xff
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000080;
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "AND rm8,r8 sets SF when the 8-bit result has bit 7 set" {
+    var mem = [_]u8{0x20, 0xD8} ++ [_]u8{0} ** 62; // and al,bl
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x000000ff;
+    s.regs[EBX] = 0x00000080;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000080), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "OR rm8,r8 sets SF when the 8-bit result has bit 7 set" {
+    var mem = [_]u8{0x08, 0xD8} ++ [_]u8{0} ** 62; // or al,bl
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000000;
+    s.regs[EBX] = 0x00000080;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000080), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "XOR rm8,r8 sets SF when the 8-bit result has bit 7 set" {
+    var mem = [_]u8{0x30, 0xD8} ++ [_]u8{0} ** 62; // xor al,bl
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x0000000f;
+    s.regs[EBX] = 0x0000008f;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000080), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "Group3 TEST rm8,imm8 sets SF when the masked result has bit 7 set" {
+    var mem = [_]u8{0xF6, 0xC0, 0xFF} ++ [_]u8{0} ** 61; // test al,0xff
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000080;
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "8-bit logic ops still clear SF when bit 7 is not set (no regression the other way)" {
+    var mem = [_]u8{0x84, 0xC0} ++ [_]u8{0} ** 62; // test al,al
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x0000007f;
+    cpuStep(&s);
+    try testing.expect(!getFlag(&s, SF_BIT));
+    try testing.expect(!getFlag(&s, ZF_BIT));
 }
 
 // ─── Public C ABI tests ───────────────────────────────────────────────────────
