@@ -42,8 +42,9 @@ const fetchS8 = core.fetchS8;
 const fetchS32 = core.fetchS32;
 const getFlag = core.getFlag;
 const setFlag = core.setFlag;
-const updateFlagsArith = core.updateFlagsArith;
-const updateFlagsLogic = core.updateFlagsLogic;
+const Width = core.Width;
+const updateFlagsArithW = core.updateFlagsArithW;
+const updateFlagsLogicW = core.updateFlagsLogicW;
 const readReg8 = core.readReg8;
 const writeReg8 = core.writeReg8;
 const push32 = core.push32;
@@ -53,12 +54,12 @@ const decodeModRM = core.decodeModRM;
 const resolveRm = core.resolveRm;
 const readRm8 = core.readRm8;
 const writeRm8 = core.writeRm8;
-const readRm32 = core.readRm32;
-const writeRm32 = core.writeRm32;
+const readRmFixed32 = core.readRmFixed32;
+const writeRmFixed32 = core.writeRmFixed32;
 const readRm8Resolved = core.readRm8Resolved;
 const writeRm8Resolved = core.writeRm8Resolved;
-const readRm32Resolved = core.readRm32Resolved;
-const writeRm32Resolved = core.writeRm32Resolved;
+const readRmFixed32Resolved = core.readRmFixed32Resolved;
+const writeRmFixed32Resolved = core.writeRmFixed32Resolved;
 const evalCond = core.evalCond;
 const opFault = core.opFault;
 
@@ -72,12 +73,6 @@ inline fn fetchImm(s: *CpuState) u32 {
 inline fn fetchSImm(s: *CpuState) i32 {
     if (s.op_size_ovr) { const v = fetch16(s); return @as(i32, @as(i16, @bitCast(v))); }
     return fetchS32(s);
-}
-fn updateFlagsLogic8(s: *CpuState, result: u8) void {
-    setFlag(s, ZF_BIT, result == 0); setFlag(s, SF_BIT, (result & 0x80) != 0);
-    setFlag(s, CF_BIT, false); setFlag(s, OF_BIT, false);
-    var p: u8 = result; p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
-    setFlag(s, PF_BIT, (p & 1) == 0);
 }
 fn readRmv(s: *CpuState, mod: u8, rm: u8) u32 {
     const r = resolveRm(s, mod, rm);
@@ -133,64 +128,97 @@ inline fn strDir(s: *CpuState) i32 { return if (getFlag(s, DF_BIT)) -1 else 1; }
 // ─── Group 1 helper (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) ────────────────────────
 fn doGroup1(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, op1: u32, op2: u32) void {
     switch (op_ext) {
-        0 => { const r = op1 +% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArith(s, @as(i64, op1) + @as(i64, op2), op1, op2, false); },
-        1 => { const r = op1 | op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogic(s, r); },
-        2 => { const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 +% op2 +% c; writeRmvResolved(s, is_reg, addr, r); updateFlagsArith(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false); },
-        3 => { const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 -% op2 -% b; writeRmvResolved(s, is_reg, addr, r); updateFlagsArith(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true); },
-        4 => { const r = op1 & op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogic(s, r); },
-        5 => { const r = op1 -% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true); },
-        6 => { const r = op1 ^ op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogic(s, r); },
-        7 => updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true),
+        0 => { const r = op1 +% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2), op1, op2, false, .w32); },
+        1 => { const r = op1 | op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, .w32); },
+        2 => { const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 +% op2 +% c; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false, .w32); },
+        3 => { const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 -% op2 -% b; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true, .w32); },
+        4 => { const r = op1 & op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, .w32); },
+        5 => { const r = op1 -% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, .w32); },
+        6 => { const r = op1 ^ op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, .w32); },
+        7 => updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, .w32),
         else => { s.faulted = true; s.halted = true; },
     }
 }
 
 // ─── Group 2 helper (shift/rotate 32-bit) ─────────────────────────────────
-fn doGroup2(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u32, count: u8) void {
-    if (count == 0) { writeRm32Resolved(s, is_reg, addr, val); return; }
+fn doGroup2(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u32, count: u8, width: Width) void {
+    // count==0 must still perform the write (real hardware still does the
+    // read-modify-write cycle for a shift/rotate by zero) -- this was
+    // hardcoded 32-bit (writeRmFixed32Resolved) regardless of op_size_ovr,
+    // a real memory-corruption bug: a 16-bit shift-by-zero on a memory
+    // operand wrote 4 bytes instead of 2.
+    if (count == 0) { writeRmvResolved(s, is_reg, addr, val); return; }
+    const bits: u6 = if (width == .w16) 16 else 32;
+    const mask: u32 = if (width == .w16) 0xFFFF else 0xFFFFFFFF;
+    const sign_bit: u32 = if (width == .w16) 0x8000 else 0x80000000;
     const c5: u5 = @truncate(count);
     switch (op_ext) {
-        0 => { // ROL
-            const r = (val << c5) | (val >> @as(u5, @truncate(32 - @as(u8, c5))));
+        0 => { // ROL -- rotate amount/OF check generalized to `bits` (was
+            // hardcoded to 32, so a 16-bit ROL wrapped around a 32-bit
+            // boundary instead of a 16-bit one).
+            const c: u8 = count % @as(u8, @intCast(bits));
+            const r: u32 = if (c == 0) val else (((val << @as(u5, @truncate(c))) | (val >> @as(u5, @truncate(bits - @as(u6, @intCast(c)))))) & mask);
             const new_cf = (r & 1) != 0;
             writeRmvResolved(s, is_reg, addr, r); setFlag(s, CF_BIT, new_cf);
-            if (count == 1) setFlag(s, OF_BIT, ((r & 0x80000000) != 0) != (((r >> 1) & 0x40000000) != 0));
+            if (count == 1) setFlag(s, OF_BIT, ((r & sign_bit) != 0) != ((r & (sign_bit >> 1)) != 0));
         },
-        1 => { // ROR
-            const r = (val >> c5) | (val << @as(u5, @truncate(32 - @as(u8, c5))));
-            const new_cf = (r & 0x80000000) != 0;
+        1 => { // ROR -- see ROL's comment
+            const c: u8 = count % @as(u8, @intCast(bits));
+            const r: u32 = if (c == 0) val else (((val >> @as(u5, @truncate(c))) | (val << @as(u5, @truncate(bits - @as(u6, @intCast(c)))))) & mask);
+            const new_cf = (r & sign_bit) != 0;
             writeRmvResolved(s, is_reg, addr, r); setFlag(s, CF_BIT, new_cf);
-            if (count == 1) setFlag(s, OF_BIT, ((r & 0x80000000) != 0) != ((val >> 31) != 0));
+            if (count == 1) setFlag(s, OF_BIT, ((r & sign_bit) != 0) != ((val & sign_bit) != 0));
         },
-        2 => { // RCL
+        2 => { // RCL -- write is already width-aware; the rotate-through-CF
+            // math itself still assumes 32-bit width internally (not
+            // generalized in this pass -- doGroup2_8's proper 9-bit-modular
+            // version is the pattern a future fix should follow for 16-bit;
+            // left as a known gap, same as the Phase 2+ consolidation this
+            // was scoped out of).
             var temp = val << c5;
             if (getFlag(s, CF_BIT)) temp |= @as(u32, 1) << @as(u5, @truncate(count - 1));
             const new_cf = ((val >> @as(u5, @truncate(32 - @as(u8, count)))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, temp); setFlag(s, CF_BIT, new_cf);
         },
-        3 => { // RCR
+        3 => { // RCR -- see RCL's comment
             var temp = val >> c5;
             if (getFlag(s, CF_BIT)) temp |= @as(u32, 1) << @as(u5, @truncate(32 - @as(u8, count)));
             const new_cf = ((val >> @as(u5, @truncate(count - 1))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, temp); setFlag(s, CF_BIT, new_cf);
         },
-        4 => { // SHL
-            const r = val << c5;
-            const new_cf = ((val >> @as(u5, @truncate(32 - @as(u8, count)))) & 1) != 0;
+        4 => { // SHL -- CF extraction and flags width generalized to `bits`
+            const r = (val << c5) & mask;
+            const shift_for_cf: u6 = if (count > bits) bits else @as(u6, @intCast(count));
+            const new_cf = shift_for_cf != 0 and ((val >> @as(u5, @truncate(bits - shift_for_cf))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogic(s, r);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, width);
         },
-        5 => { // SHR
-            const r = val >> c5;
-            const new_cf = ((val >> @as(u5, @truncate(count - 1))) & 1) != 0;
+        5 => { // SHR -- see SHL's comment
+            const r = (val & mask) >> c5;
+            const shift_for_cf: u6 = if (count > bits) bits else @as(u6, @intCast(count));
+            const new_cf = shift_for_cf != 0 and ((val >> @as(u5, @truncate(shift_for_cf - 1))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogic(s, r);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, width);
         },
-        7 => { // SAR
-            const r: u32 = @bitCast(@as(i32, @bitCast(val)) >> c5);
-            const new_cf = ((val >> @as(u5, @truncate(count - 1))) & 1) != 0;
-            writeRm32Resolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogic(s, r);
+        7 => { // SAR -- was hardcoded-32-bit write (writeRmFixed32Resolved,
+            // same memory-corruption shape as count==0 above) AND assumed a
+            // 32-bit sign bit unconditionally: once the caller's read is
+            // width-aware, a genuinely-16-bit operand's upper 16 bits are
+            // correctly zero (not sign-extended), so shifting `val` as a
+            // plain i32 would treat every 16-bit operand as non-negative.
+            // Sign-extend from the width-correct bit first instead.
+            const shifted: u32 = switch (width) {
+                .w16 => blk: {
+                    const signed16: i16 = @bitCast(@as(u16, @truncate(val)));
+                    const wide: i32 = signed16;
+                    break :blk @as(u32, @bitCast(wide >> c5)) & mask;
+                },
+                else => @bitCast(@as(i32, @bitCast(val)) >> c5),
+            };
+            const shift_for_cf: u6 = if (count > bits) bits else @as(u6, @intCast(count));
+            const new_cf = shift_for_cf != 0 and ((val >> @as(u5, @truncate(shift_for_cf - 1))) & 1) != 0;
+            writeRmvResolved(s, is_reg, addr, shifted);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, shifted, width);
         },
         else => { s.faulted = true; s.halted = true; },
     }
@@ -240,21 +268,21 @@ fn doGroup2_8(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u8, count:
             const r: u8 = if (c8 == 0) val else val << c8;
             const new_cf = if (count <= 8) ((val >> @as(u3, @truncate(8 - @as(u8, count)))) & 1) != 0 else false;
             writeRm8Resolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogic8(s, r);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, .w8);
         },
         5 => { // SHR r/m8
             const c8: u3 = @truncate(count & 7);
             const r: u8 = if (c8 == 0) val else val >> c8;
             const new_cf = ((val >> @as(u3, @truncate(count - 1))) & 1) != 0;
             writeRm8Resolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogic8(s, r);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, .w8);
         },
         7 => { // SAR r/m8
             const c8: u3 = @truncate(count & 7);
             const r: u8 = @bitCast(@as(i8, @bitCast(val)) >> c8);
             const new_cf = ((val >> @as(u3, @truncate(count - 1))) & 1) != 0;
             writeRm8Resolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogic8(s, r);
+            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, .w8);
         },
         else => { s.faulted = true; s.halted = true; },
     }
@@ -265,163 +293,201 @@ fn op00(s: *CpuState) void { // ADD rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     const op2 = readReg8(s, d.reg); const r = res.value +% op2;
     writeRm8Resolved(s, res.is_reg, res.addr, r);
-    updateFlagsArith(s, @as(i64, res.value) + @as(i64, op2), res.value, op2, false);
+    updateFlagsArithW(s, @as(i64, res.value) + @as(i64, op2), res.value, op2, false, .w8);
 }
-fn op01(s: *CpuState) void { // ADD rmv, rv
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    const op2 = s.regs[d.reg]; const r = res.value +% op2;
+fn op01(s: *CpuState) void { // ADD rmv, rv -- was hardcoded-32-bit read
+    // (readRmFixed32Resolved) paired with a width-aware write (writeRmvResolved);
+    // now width-aware throughout, including masking the register operand
+    // under 0x66, which the fixed-32 read never did either.
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const r = res.value +% op2;
     writeRmvResolved(s, res.is_reg, res.addr, r);
-    updateFlagsArith(s, @as(i64, res.value) + @as(i64, op2), res.value, op2, false);
+    updateFlagsArithW(s, @as(i64, res.value) + @as(i64, op2), res.value, op2, false, width);
 }
 fn op02(s: *CpuState) void { // ADD r8, rm8
     const d = decodeModRM(s); const op1 = readReg8(s, d.reg); const op2 = readRm8(s, d.mod, d.rm);
     writeReg8(s, d.reg, op1 +% op2);
-    updateFlagsArith(s, @as(i64, op1) + @as(i64, op2), op1, op2, false);
+    updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2), op1, op2, false, .w8);
 }
-fn op03(s: *CpuState) void { // ADD r32, rm32
-    const d = decodeModRM(s); const op1 = s.regs[d.reg]; const op2 = readRm32(s, d.mod, d.rm);
-    s.regs[d.reg] = op1 +% op2;
-    updateFlagsArith(s, @as(i64, op1) + @as(i64, op2), op1, op2, false);
+fn op03(s: *CpuState) void { // ADD rv, rmv -- op_size_ovr was never consulted
+    // at all here (unlike its MOV counterpart op8B); now mirrors op8B's pattern.
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op1 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const op2 = readRmv(s, d.mod, d.rm);
+    const r = op1 +% op2;
+    if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (r & 0xFFFF)
+    else s.regs[d.reg] = r;
+    updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2), op1, op2, false, width);
 }
 fn op04(s: *CpuState) void { // ADD AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al +% imm);
-    updateFlagsArith(s, @as(i64, al) + @as(i64, imm), al, imm, false);
+    updateFlagsArithW(s, @as(i64, al) + @as(i64, imm), al, imm, false, .w8);
 }
 fn op05(s: *CpuState) void { // ADD EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s);
-    writeEaxv(s, a +% imm); updateFlagsArith(s, @as(i64, a) + @as(i64, imm), a, imm, false);
+    writeEaxv(s, a +% imm); updateFlagsArithW(s, @as(i64, a) + @as(i64, imm), a, imm, false, .w32);
 }
 fn op10(s: *CpuState) void { // ADC rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     const op2 = readReg8(s, d.reg); const c: u8 = if (getFlag(s, CF_BIT)) 1 else 0;
     writeRm8Resolved(s, res.is_reg, res.addr, res.value +% op2 +% c);
-    updateFlagsArith(s, @as(i64, res.value) + @as(i64, op2) + @as(i64, c), res.value, op2 +% c, false);
+    updateFlagsArithW(s, @as(i64, res.value) + @as(i64, op2) + @as(i64, c), res.value, op2 +% c, false, .w8);
 }
-fn op11(s: *CpuState) void { // ADC rmv, rv
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    const op2 = s.regs[d.reg]; const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
+fn op11(s: *CpuState) void { // ADC rmv, rv -- see op01's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
     writeRmvResolved(s, res.is_reg, res.addr, res.value +% op2 +% c);
-    updateFlagsArith(s, @as(i64, res.value) + @as(i64, op2) + @as(i64, c), res.value, op2 +% c, false);
+    updateFlagsArithW(s, @as(i64, res.value) + @as(i64, op2) + @as(i64, c), res.value, op2 +% c, false, width);
 }
 fn op12(s: *CpuState) void { // ADC r8, rm8
     const d = decodeModRM(s); const op1 = readReg8(s, d.reg); const op2 = readRm8(s, d.mod, d.rm);
     const c: u8 = if (getFlag(s, CF_BIT)) 1 else 0;
     writeReg8(s, d.reg, op1 +% op2 +% c);
-    updateFlagsArith(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false);
+    updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false, .w8);
 }
-fn op13(s: *CpuState) void { // ADC r32, rm32
-    const d = decodeModRM(s); const op1 = s.regs[d.reg]; const op2 = readRm32(s, d.mod, d.rm);
+fn op13(s: *CpuState) void { // ADC rv, rmv -- see op03's comment
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op1 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const op2 = readRmv(s, d.mod, d.rm);
     const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
-    s.regs[d.reg] = op1 +% op2 +% c;
-    updateFlagsArith(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false);
+    const r = op1 +% op2 +% c;
+    if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (r & 0xFFFF)
+    else s.regs[d.reg] = r;
+    updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false, width);
 }
 fn op14(s: *CpuState) void { // ADC AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]); const c: u8 = if (getFlag(s, CF_BIT)) 1 else 0;
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al +% imm +% c);
-    updateFlagsArith(s, @as(i64, al) + @as(i64, imm) + @as(i64, c), al, imm +% c, false);
+    updateFlagsArithW(s, @as(i64, al) + @as(i64, imm) + @as(i64, c), al, imm +% c, false, .w8);
 }
 fn op15(s: *CpuState) void { // ADC EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
-    writeEaxv(s, a +% imm +% c); updateFlagsArith(s, @as(i64, a) + @as(i64, imm) + @as(i64, c), a, imm +% c, false);
+    writeEaxv(s, a +% imm +% c); updateFlagsArithW(s, @as(i64, a) + @as(i64, imm) + @as(i64, c), a, imm +% c, false, .w32);
 }
 fn op18(s: *CpuState) void { // SBB rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     const op2 = readReg8(s, d.reg); const b: u8 = if (getFlag(s, CF_BIT)) 1 else 0;
     writeRm8Resolved(s, res.is_reg, res.addr, res.value -% op2 -% b);
-    updateFlagsArith(s, @as(i64, res.value) - @as(i64, op2) - @as(i64, b), res.value, op2 +% b, true);
+    updateFlagsArithW(s, @as(i64, res.value) - @as(i64, op2) - @as(i64, b), res.value, op2 +% b, true, .w8);
 }
-fn op19(s: *CpuState) void { // SBB rmv, rv
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    const op2 = s.regs[d.reg]; const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
+fn op19(s: *CpuState) void { // SBB rmv, rv -- see op01's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
     writeRmvResolved(s, res.is_reg, res.addr, res.value -% op2 -% b);
-    updateFlagsArith(s, @as(i64, res.value) - @as(i64, op2) - @as(i64, b), res.value, op2 +% b, true);
+    updateFlagsArithW(s, @as(i64, res.value) - @as(i64, op2) - @as(i64, b), res.value, op2 +% b, true, width);
 }
 fn op1A(s: *CpuState) void { // SBB r8, rm8
     const d = decodeModRM(s); const op1 = readReg8(s, d.reg); const op2 = readRm8(s, d.mod, d.rm);
     const b: u8 = if (getFlag(s, CF_BIT)) 1 else 0;
     writeReg8(s, d.reg, op1 -% op2 -% b);
-    updateFlagsArith(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true);
+    updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true, .w8);
 }
-fn op1B(s: *CpuState) void { // SBB r32, rm32
-    const d = decodeModRM(s); const op1 = s.regs[d.reg]; const op2 = readRm32(s, d.mod, d.rm);
+fn op1B(s: *CpuState) void { // SBB rv, rmv -- see op03's comment
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op1 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const op2 = readRmv(s, d.mod, d.rm);
     const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
-    s.regs[d.reg] = op1 -% op2 -% b;
-    updateFlagsArith(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true);
+    const r = op1 -% op2 -% b;
+    if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (r & 0xFFFF)
+    else s.regs[d.reg] = r;
+    updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true, width);
 }
 fn op1C(s: *CpuState) void { // SBB AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]); const b: u8 = if (getFlag(s, CF_BIT)) 1 else 0;
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al -% imm -% b);
-    updateFlagsArith(s, @as(i64, al) - @as(i64, imm) - @as(i64, b), al, imm +% b, true);
+    updateFlagsArithW(s, @as(i64, al) - @as(i64, imm) - @as(i64, b), al, imm +% b, true, .w8);
 }
 fn op1D(s: *CpuState) void { // SBB EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
-    writeEaxv(s, a -% imm -% b); updateFlagsArith(s, @as(i64, a) - @as(i64, imm) - @as(i64, b), a, imm +% b, true);
+    writeEaxv(s, a -% imm -% b); updateFlagsArithW(s, @as(i64, a) - @as(i64, imm) - @as(i64, b), a, imm +% b, true, .w32);
 }
 fn op28(s: *CpuState) void { // SUB rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     const op2 = readReg8(s, d.reg);
     writeRm8Resolved(s, res.is_reg, res.addr, res.value -% op2);
-    updateFlagsArith(s, @as(i64, res.value) - @as(i64, op2), res.value, op2, true);
+    updateFlagsArithW(s, @as(i64, res.value) - @as(i64, op2), res.value, op2, true, .w8);
 }
-fn op29(s: *CpuState) void { // SUB rmv, rv
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    const op2 = s.regs[d.reg];
+fn op29(s: *CpuState) void { // SUB rmv, rv -- see op01's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
     writeRmvResolved(s, res.is_reg, res.addr, res.value -% op2);
-    updateFlagsArith(s, @as(i64, res.value) - @as(i64, op2), res.value, op2, true);
+    updateFlagsArithW(s, @as(i64, res.value) - @as(i64, op2), res.value, op2, true, width);
 }
 fn op2A(s: *CpuState) void { // SUB r8, rm8
     const d = decodeModRM(s); const op1 = readReg8(s, d.reg); const op2 = readRm8(s, d.mod, d.rm);
-    writeReg8(s, d.reg, op1 -% op2); updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true);
+    writeReg8(s, d.reg, op1 -% op2); updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, .w8);
 }
-fn op2B(s: *CpuState) void { // SUB r32, rm32
-    const d = decodeModRM(s); const op1 = s.regs[d.reg]; const op2 = readRm32(s, d.mod, d.rm);
-    s.regs[d.reg] = op1 -% op2; updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true);
+fn op2B(s: *CpuState) void { // SUB rv, rmv -- see op03's comment
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op1 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const op2 = readRmv(s, d.mod, d.rm);
+    const r = op1 -% op2;
+    if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (r & 0xFFFF)
+    else s.regs[d.reg] = r;
+    updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, width);
 }
 fn op2C(s: *CpuState) void { // SUB AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al -% imm);
-    updateFlagsArith(s, @as(i64, al) - @as(i64, imm), al, imm, true);
+    updateFlagsArithW(s, @as(i64, al) - @as(i64, imm), al, imm, true, .w8);
 }
 fn op2D(s: *CpuState) void { // SUB EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s);
-    writeEaxv(s, a -% imm); updateFlagsArith(s, @as(i64, a) - @as(i64, imm), a, imm, true);
+    writeEaxv(s, a -% imm); updateFlagsArithW(s, @as(i64, a) - @as(i64, imm), a, imm, true, .w32);
 }
 fn op38(s: *CpuState) void { // CMP rm8, r8
     const d = decodeModRM(s); const op1 = readRm8(s, d.mod, d.rm); const op2 = readReg8(s, d.reg);
-    updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true);
+    updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, .w8);
 }
-fn op39(s: *CpuState) void { // CMP rmv, rv
-    const d = decodeModRM(s); const op1 = readRm32(s, d.mod, d.rm); const op2 = s.regs[d.reg];
-    updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true);
+fn op39(s: *CpuState) void { // CMP rmv, rv -- see op01's comment (no write here, flags only)
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op1 = readRmv(s, d.mod, d.rm);
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, width);
 }
 fn op3A(s: *CpuState) void { // CMP r8, rm8
     const d = decodeModRM(s); const op1 = readReg8(s, d.reg); const op2 = readRm8(s, d.mod, d.rm);
-    updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true);
+    updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, .w8);
 }
-fn op3B(s: *CpuState) void { // CMP r32, rm32
-    const d = decodeModRM(s); const op1 = s.regs[d.reg]; const op2 = readRm32(s, d.mod, d.rm);
-    updateFlagsArith(s, @as(i64, op1) - @as(i64, op2), op1, op2, true);
+fn op3B(s: *CpuState) void { // CMP rv, rmv -- see op03's comment (no write)
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op1 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const op2 = readRmv(s, d.mod, d.rm);
+    updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, width);
 }
 fn op3C(s: *CpuState) void { // CMP AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
-    updateFlagsArith(s, @as(i64, al) - @as(i64, imm), al, imm, true);
+    updateFlagsArithW(s, @as(i64, al) - @as(i64, imm), al, imm, true, .w8);
 }
 fn op3D(s: *CpuState) void { // CMP EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s);
-    updateFlagsArith(s, @as(i64, a) - @as(i64, imm), a, imm, true);
+    updateFlagsArithW(s, @as(i64, a) - @as(i64, imm), a, imm, true, .w32);
 }
 fn opIncR32(comptime r: u3) OpFn { return struct { fn f(s: *CpuState) void {
     const op1 = s.regs[r]; s.regs[r] = op1 +% 1;
-    const cf = getFlag(s, CF_BIT); updateFlagsArith(s, @as(i64, op1) + 1, op1, 1, false); setFlag(s, CF_BIT, cf);
+    const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, op1) + 1, op1, 1, false, .w32); setFlag(s, CF_BIT, cf);
 }}.f; }
 fn opDecR32(comptime r: u3) OpFn { return struct { fn f(s: *CpuState) void {
     const op1 = s.regs[r]; s.regs[r] = op1 -% 1;
-    const cf = getFlag(s, CF_BIT); updateFlagsArith(s, @as(i64, op1) - 1, op1, 1, true); setFlag(s, CF_BIT, cf);
+    const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, op1) - 1, op1, 1, true, .w32); setFlag(s, CF_BIT, cf);
 }}.f; }
 fn op69(s: *CpuState) void { // IMUL r32, rm32, imm32
     const d = decodeModRM(s);
-    const op1: i64 = @as(i32, @bitCast(readRm32(s, d.mod, d.rm)));
+    const op1: i64 = @as(i32, @bitCast(readRmFixed32(s, d.mod, d.rm)));
     const imm: i64 = fetchS32(s);
     const r32: u32 = @truncate(@as(u64, @bitCast(op1 * imm)));
     s.regs[d.reg] = r32;
@@ -430,7 +496,7 @@ fn op69(s: *CpuState) void { // IMUL r32, rm32, imm32
 }
 fn op6B(s: *CpuState) void { // IMUL r32, rm32, imm8
     const d = decodeModRM(s);
-    const op1: i64 = @as(i32, @bitCast(readRm32(s, d.mod, d.rm)));
+    const op1: i64 = @as(i32, @bitCast(readRmFixed32(s, d.mod, d.rm)));
     const imm: i64 = fetchS8(s);
     const r32: u32 = @truncate(@as(u64, @bitCast(op1 * imm)));
     s.regs[d.reg] = r32;
@@ -441,14 +507,14 @@ fn op80(s: *CpuState) void { // Group 1 byte: op rm8, imm8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     const imm = fetch8(s); const op1 = res.value;
     switch (d.reg) {
-        0 => { const r = op1 +% imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsArith(s, @as(i64,op1)+@as(i64,imm), op1, imm, false); },
-        1 => { const r = op1 | imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r); },
-        2 => { const c: u8 = if(getFlag(s,CF_BIT)) 1 else 0; const r = op1+%imm+%c; writeRm8Resolved(s,res.is_reg,res.addr,r); updateFlagsArith(s,@as(i64,op1)+@as(i64,imm)+@as(i64,c),op1,imm+%c,false); },
-        3 => { const b: u8 = if(getFlag(s,CF_BIT)) 1 else 0; const r = op1-%imm-%b; writeRm8Resolved(s,res.is_reg,res.addr,r); updateFlagsArith(s,@as(i64,op1)-@as(i64,imm)-@as(i64,b),op1,imm+%b,true); },
-        4 => { const r = op1 & imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r); },
-        5 => { const r = op1 -% imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsArith(s, @as(i64,op1)-@as(i64,imm), op1, imm, true); },
-        6 => { const r = op1 ^ imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r); },
-        7 => updateFlagsArith(s, @as(i64,op1)-@as(i64,imm), op1, imm, true),
+        0 => { const r = op1 +% imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsArithW(s, @as(i64,op1)+@as(i64,imm), op1, imm, false, .w8); },
+        1 => { const r = op1 | imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, .w8); },
+        2 => { const c: u8 = if(getFlag(s,CF_BIT)) 1 else 0; const r = op1+%imm+%c; writeRm8Resolved(s,res.is_reg,res.addr,r); updateFlagsArithW(s,@as(i64,op1)+@as(i64,imm)+@as(i64,c),op1,imm+%c,false, .w8); },
+        3 => { const b: u8 = if(getFlag(s,CF_BIT)) 1 else 0; const r = op1-%imm-%b; writeRm8Resolved(s,res.is_reg,res.addr,r); updateFlagsArithW(s,@as(i64,op1)-@as(i64,imm)-@as(i64,b),op1,imm+%b,true, .w8); },
+        4 => { const r = op1 & imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, .w8); },
+        5 => { const r = op1 -% imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsArithW(s, @as(i64,op1)-@as(i64,imm), op1, imm, true, .w8); },
+        6 => { const r = op1 ^ imm; writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, .w8); },
+        7 => updateFlagsArithW(s, @as(i64,op1)-@as(i64,imm), op1, imm, true, .w8),
         else => {},
     }
 }
@@ -465,8 +531,8 @@ fn op86(s: *CpuState) void { // XCHG r8, rm8
     writeReg8(s, d.reg, v2); writeRm8(s, d.mod, d.rm, v1);
 }
 fn op87(s: *CpuState) void { // XCHG r32, rm32
-    const d = decodeModRM(s); const v1 = s.regs[d.reg]; const v2 = readRm32(s, d.mod, d.rm);
-    s.regs[d.reg] = v2; writeRm32(s, d.mod, d.rm, v1);
+    const d = decodeModRM(s); const v1 = s.regs[d.reg]; const v2 = readRmFixed32(s, d.mod, d.rm);
+    s.regs[d.reg] = v2; writeRmFixed32(s, d.mod, d.rm, v1);
 }
 fn opXchgEaxR(comptime r: u3) OpFn { return struct { fn f(s: *CpuState) void {
     const tmp = s.regs[EAX]; s.regs[EAX] = s.regs[r]; s.regs[r] = tmp;
@@ -476,14 +542,17 @@ fn op99(s: *CpuState) void { // CDQ
 }
 fn opA8(s: *CpuState) void { // TEST AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
-    updateFlagsLogic8(s, al & imm);
+    updateFlagsLogicW(s, al & imm, .w8);
 }
 fn opA9(s: *CpuState) void { // TEST EAX/AX, immv
-    const a = readEaxv(s); const imm = fetchImm(s); updateFlagsLogic(s, a & imm);
+    const a = readEaxv(s); const imm = fetchImm(s); updateFlagsLogicW(s, a & imm, .w32);
 }
-fn opC1(s: *CpuState) void { // Group 2: shift rmv, imm8
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    doGroup2(s, res.is_reg, res.addr, d.reg, res.value, fetch8(s) & 0x1F);
+fn opC1(s: *CpuState) void { // Group 2: shift rmv, imm8 -- read was hardcoded
+    // 32-bit (readRmFixed32Resolved), ignoring op_size_ovr; see doGroup2's
+    // own comment for the layered bugs this + doGroup2 together had.
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    doGroup2(s, res.is_reg, res.addr, d.reg, res.value, fetch8(s) & 0x1F, width);
 }
 fn opC2(s: *CpuState) void { // RET imm16
     const ret = pop32(s); const imm = fetch16(s); s.regs[ESP] +%= imm; s.eip = ret;
@@ -509,28 +578,30 @@ fn opC0(s: *CpuState) void { // Group 2: shift rm8, imm8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     doGroup2_8(s, res.is_reg, res.addr, d.reg, res.value, fetch8(s) & 0x1F);
 }
-fn opD1(s: *CpuState) void { // Group 2: shift rmv, 1
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    doGroup2(s, res.is_reg, res.addr, d.reg, res.value, 1);
+fn opD1(s: *CpuState) void { // Group 2: shift rmv, 1 -- see opC1's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    doGroup2(s, res.is_reg, res.addr, d.reg, res.value, 1, width);
 }
 fn opD2(s: *CpuState) void { // Group 2: shift rm8, CL
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     doGroup2_8(s, res.is_reg, res.addr, d.reg, res.value, @truncate(s.regs[ECX] & 0x1F));
 }
-fn opD3(s: *CpuState) void { // Group 2: shift rmv, CL
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    doGroup2(s, res.is_reg, res.addr, d.reg, res.value, @truncate(s.regs[ECX] & 0x1F));
+fn opD3(s: *CpuState) void { // Group 2: shift rmv, CL -- see opC1's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    doGroup2(s, res.is_reg, res.addr, d.reg, res.value, @truncate(s.regs[ECX] & 0x1F), width);
 }
 fn opF6(s: *CpuState) void { // Group 3 byte
     const d = decodeModRM(s); const val = readRm8(s, d.mod, d.rm);
     switch (d.reg) {
-        0 => updateFlagsLogic8(s, val & fetch8(s)),
+        0 => updateFlagsLogicW(s, val & fetch8(s), .w8),
         2 => writeRm8(s, d.mod, d.rm, ~val),
         3 => {
             const r = (0 -% @as(u32, val)) & 0xFF;
             writeRm8(s, d.mod, d.rm, @truncate(r));
             setFlag(s, CF_BIT, val != 0);
-            updateFlagsArith(s, -@as(i64, val), 0, val, true);
+            updateFlagsArithW(s, -@as(i64, val), 0, val, true, .w8);
         },
         4 => { // MUL AL, rm8
             const al: u32 = s.regs[EAX] & 0xFF; const r = al * val;
@@ -564,20 +635,20 @@ fn opF7(s: *CpuState) void { // Group 3 word/dword
     const d = decodeModRM(s); const is16 = s.op_size_ovr;
     switch (d.reg) {
         0 => { // TEST rmv, immv
-            if (is16) updateFlagsLogic(s, readRmv(s,d.mod,d.rm) & fetch16(s))
-            else updateFlagsLogic(s, readRm32(s,d.mod,d.rm) & fetch32(s));
+            if (is16) updateFlagsLogicW(s, readRmv(s,d.mod,d.rm) & fetch16(s), .w32)
+            else updateFlagsLogicW(s, readRmFixed32(s,d.mod,d.rm) & fetch32(s), .w32);
         },
         2 => { // NOT
             if (is16) writeRmv(s,d.mod,d.rm, ~readRmv(s,d.mod,d.rm) & 0xFFFF)
-            else writeRm32(s,d.mod,d.rm, ~readRm32(s,d.mod,d.rm));
+            else writeRmFixed32(s,d.mod,d.rm, ~readRmFixed32(s,d.mod,d.rm));
         },
         3 => { // NEG
             if (is16) {
                 const v = readRmv(s,d.mod,d.rm); const r = (0 -% v) & 0xFFFF;
-                writeRmv(s,d.mod,d.rm,r); setFlag(s,CF_BIT,v!=0); updateFlagsArith(s,-@as(i64,v),0,v,false);
+                writeRmv(s,d.mod,d.rm,r); setFlag(s,CF_BIT,v!=0); updateFlagsArithW(s,-@as(i64,v),0,v,false, .w32);
             } else {
-                const v = readRm32(s,d.mod,d.rm); const r = 0 -% v;
-                writeRm32(s,d.mod,d.rm,r); setFlag(s,CF_BIT,v!=0); updateFlagsArith(s,-@as(i64,v),0,v,true);
+                const v = readRmFixed32(s,d.mod,d.rm); const r = 0 -% v;
+                writeRmFixed32(s,d.mod,d.rm,r); setFlag(s,CF_BIT,v!=0); updateFlagsArithW(s,-@as(i64,v),0,v,true, .w32);
             }
         },
         4 => { // MUL
@@ -588,7 +659,7 @@ fn opF7(s: *CpuState) void { // Group 3 word/dword
                 s.regs[EDX] = (s.regs[EDX] & 0xFFFF0000) | ((r >> 16) & 0xFFFF);
                 setFlag(s,CF_BIT,ov); setFlag(s,OF_BIT,ov);
             } else {
-                const op1: u64 = s.regs[EAX]; const op2: u64 = readRm32(s,d.mod,d.rm);
+                const op1: u64 = s.regs[EAX]; const op2: u64 = readRmFixed32(s,d.mod,d.rm);
                 const r: u64 = op1 * op2;
                 s.regs[EAX] = @truncate(r); s.regs[EDX] = @truncate(r >> 32);
                 const ov = s.regs[EDX] != 0; setFlag(s,CF_BIT,ov); setFlag(s,OF_BIT,ov);
@@ -606,7 +677,7 @@ fn opF7(s: *CpuState) void { // Group 3 word/dword
                 setFlag(s,CF_BIT,((@as(u32,@bitCast(r))>>16)&0xFFFF)!=se); setFlag(s,OF_BIT,((@as(u32,@bitCast(r))>>16)&0xFFFF)!=se);
             } else {
                 const op1: i64 = @as(i32, @bitCast(s.regs[EAX]));
-                const op2: i64 = @as(i32, @bitCast(readRm32(s,d.mod,d.rm)));
+                const op2: i64 = @as(i32, @bitCast(readRmFixed32(s,d.mod,d.rm)));
                 const r: i64 = op1 * op2;
                 s.regs[EAX] = @truncate(@as(u64, @bitCast(r)));
                 s.regs[EDX] = @truncate(@as(u64, @bitCast(r)) >> 32);
@@ -622,7 +693,7 @@ fn opF7(s: *CpuState) void { // Group 3 word/dword
                 s.regs[EAX] = (s.regs[EAX]&0xFFFF0000)|(dvd/div)&0xFFFF;
                 s.regs[EDX] = (s.regs[EDX]&0xFFFF0000)|(dvd%div)&0xFFFF;
             } else {
-                const div: u64 = readRm32(s,d.mod,d.rm);
+                const div: u64 = readRmFixed32(s,d.mod,d.rm);
                 if (div == 0) { s.faulted=true; s.halted=true; return; }
                 const dvd: u64 = (@as(u64,s.regs[EDX]) << 32) | @as(u64,s.regs[EAX]);
                 const q = dvd / div;
@@ -641,7 +712,7 @@ fn opF7(s: *CpuState) void { // Group 3 word/dword
                 s.regs[EAX] = (s.regs[EAX]&0xFFFF0000)|(@as(u32,@bitCast(q))&0xFFFF);
                 s.regs[EDX] = (s.regs[EDX]&0xFFFF0000)|(@as(u32,@bitCast(r2))&0xFFFF);
             } else {
-                const div: i64 = @as(i32, @bitCast(readRm32(s,d.mod,d.rm)));
+                const div: i64 = @as(i32, @bitCast(readRmFixed32(s,d.mod,d.rm)));
                 if (div == 0) { s.faulted=true; s.halted=true; return; }
                 const edx_s: i64 = @as(i32, @bitCast(s.regs[EDX]));
                 const dvd: i64 = (edx_s << 32) | @as(i64, @intCast(s.regs[EAX]));
@@ -657,78 +728,102 @@ fn opF7(s: *CpuState) void { // Group 3 word/dword
 // ─── Logic opcodes ────────────────────────────────────────────────────────────
 fn op08(s: *CpuState) void { // OR rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
-    const r = res.value | readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r);
+    const r = res.value | readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, .w8);
 }
-fn op09(s: *CpuState) void { // OR rmv, rv
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    const r = res.value | s.regs[d.reg]; writeRmvResolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r);
+fn op09(s: *CpuState) void { // OR rmv, rv -- see op01's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const r = res.value | op2; writeRmvResolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, width);
 }
 fn op0A(s: *CpuState) void { // OR r8, rm8
     const d = decodeModRM(s); const r = readReg8(s, d.reg) | readRm8(s, d.mod, d.rm);
-    writeReg8(s, d.reg, r); updateFlagsLogic8(s, r);
+    writeReg8(s, d.reg, r); updateFlagsLogicW(s, r, .w8);
 }
-fn op0B(s: *CpuState) void { // OR r32, rm32
-    const d = decodeModRM(s); const r = s.regs[d.reg] | readRm32(s, d.mod, d.rm);
-    s.regs[d.reg] = r; updateFlagsLogic(s, r);
+fn op0B(s: *CpuState) void { // OR rv, rmv -- see op03's comment
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const r = s.regs[d.reg] | readRmv(s, d.mod, d.rm);
+    if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (r & 0xFFFF)
+    else s.regs[d.reg] = r;
+    updateFlagsLogicW(s, r, width);
 }
 fn op0C(s: *CpuState) void { // OR AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
-    const r = al | imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogic8(s, r);
+    const r = al | imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogicW(s, r, .w8);
 }
 fn op0D(s: *CpuState) void { // OR EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); const r = a | imm;
-    updateFlagsLogic(s, r); writeEaxv(s, r);
+    updateFlagsLogicW(s, r, .w32); writeEaxv(s, r);
 }
 fn op20(s: *CpuState) void { // AND rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
-    const r = res.value & readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r);
+    const r = res.value & readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, .w8);
 }
-fn op21(s: *CpuState) void { // AND rmv, rv
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    const r = res.value & s.regs[d.reg]; writeRmvResolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r);
+fn op21(s: *CpuState) void { // AND rmv, rv -- see op01's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const r = res.value & op2; writeRmvResolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, width);
 }
 fn op22(s: *CpuState) void { // AND r8, rm8
     const d = decodeModRM(s); const r = readReg8(s, d.reg) & readRm8(s, d.mod, d.rm);
-    writeReg8(s, d.reg, r); updateFlagsLogic8(s, r);
+    writeReg8(s, d.reg, r); updateFlagsLogicW(s, r, .w8);
 }
-fn op23(s: *CpuState) void { // AND r32, rm32
-    const d = decodeModRM(s); const r = s.regs[d.reg] & readRm32(s, d.mod, d.rm);
-    s.regs[d.reg] = r; updateFlagsLogic(s, r);
+fn op23(s: *CpuState) void { // AND rv, rmv -- see op03's comment
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const r = s.regs[d.reg] & readRmv(s, d.mod, d.rm);
+    if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (r & 0xFFFF)
+    else s.regs[d.reg] = r;
+    updateFlagsLogicW(s, r, width);
 }
 fn op24(s: *CpuState) void { // AND AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
-    const r = al & imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogic8(s, r);
+    const r = al & imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogicW(s, r, .w8);
 }
 fn op25(s: *CpuState) void { // AND EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); const r = a & imm;
-    updateFlagsLogic(s, r); writeEaxv(s, r);
+    updateFlagsLogicW(s, r, .w32); writeEaxv(s, r);
 }
 fn op30(s: *CpuState) void { // XOR rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
-    const r = res.value ^ readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogic8(s, r);
+    const r = res.value ^ readReg8(s, d.reg); writeRm8Resolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, .w8);
 }
-fn op31(s: *CpuState) void { // XOR rmv, rv
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
-    const r = res.value ^ s.regs[d.reg]; writeRmvResolved(s, res.is_reg, res.addr, r); updateFlagsLogic(s, r);
+fn op31(s: *CpuState) void { // XOR rmv, rv -- see op01's comment
+    const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    const r = res.value ^ op2; writeRmvResolved(s, res.is_reg, res.addr, r); updateFlagsLogicW(s, r, width);
 }
 fn op32(s: *CpuState) void { // XOR r8, rm8
     const d = decodeModRM(s); const r = readReg8(s, d.reg) ^ readRm8(s, d.mod, d.rm);
-    writeReg8(s, d.reg, r); updateFlagsLogic8(s, r);
+    writeReg8(s, d.reg, r); updateFlagsLogicW(s, r, .w8);
 }
-fn op33(s: *CpuState) void { // XOR r32, rm32
-    const d = decodeModRM(s); const r = s.regs[d.reg] ^ readRm32(s, d.mod, d.rm);
-    s.regs[d.reg] = r; updateFlagsLogic(s, r);
+fn op33(s: *CpuState) void { // XOR rv, rmv -- see op03's comment
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const r = s.regs[d.reg] ^ readRmv(s, d.mod, d.rm);
+    if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (r & 0xFFFF)
+    else s.regs[d.reg] = r;
+    updateFlagsLogicW(s, r, width);
 }
 fn op35(s: *CpuState) void { // XOR EAX/AX, immv
     const a = readEaxv(s); const imm = fetchImm(s); const r = a ^ imm;
-    updateFlagsLogic(s, r); writeEaxv(s, r);
+    updateFlagsLogicW(s, r, .w32); writeEaxv(s, r);
 }
 fn op84(s: *CpuState) void { // TEST rm8, r8
     const d = decodeModRM(s);
-    updateFlagsLogic8(s, readRm8(s, d.mod, d.rm) & readReg8(s, d.reg));
+    updateFlagsLogicW(s, readRm8(s, d.mod, d.rm) & readReg8(s, d.reg), .w8);
 }
-fn op85(s: *CpuState) void { // TEST rmv, rv
-    const d = decodeModRM(s); updateFlagsLogic(s, readRm32(s, d.mod, d.rm) & s.regs[d.reg]);
+fn op85(s: *CpuState) void { // TEST rmv, rv -- was hardcoded-32-bit read AND
+    // a hardcoded-32-bit flag width; fixing only the read would still always
+    // report SF=0 for a correctly-16-bit-masked value (bit 31 of a masked
+    // 16-bit result is never set), so both halves need the width parameter.
+    const d = decodeModRM(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    const op2 = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+    updateFlagsLogicW(s, readRmv(s, d.mod, d.rm) & op2, width);
 }
 
 // ─── Data movement opcodes ────────────────────────────────────────────────────
@@ -738,7 +833,7 @@ fn op88(s: *CpuState) void { // MOV rm8, r8
 fn op89(s: *CpuState) void { // MOV rmv, rv
     const d = decodeModRM(s);
     if (s.op_size_ovr) writeRmv(s, d.mod, d.rm, s.regs[d.reg] & 0xFFFF)
-    else writeRm32(s, d.mod, d.rm, s.regs[d.reg]);
+    else writeRmFixed32(s, d.mod, d.rm, s.regs[d.reg]);
 }
 fn op8A(s: *CpuState) void { // MOV r8, rm8
     const d = decodeModRM(s); writeReg8(s, d.reg, readRm8(s, d.mod, d.rm));
@@ -746,7 +841,7 @@ fn op8A(s: *CpuState) void { // MOV r8, rm8
 fn op8B(s: *CpuState) void { // MOV rv, rmv
     const d = decodeModRM(s);
     if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (readRmv(s, d.mod, d.rm) & 0xFFFF)
-    else s.regs[d.reg] = readRm32(s, d.mod, d.rm);
+    else s.regs[d.reg] = readRmFixed32(s, d.mod, d.rm);
 }
 fn op8D(s: *CpuState) void { // LEA r32, rm
     const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm); s.regs[d.reg] = r.addr;
@@ -981,7 +1076,7 @@ fn opAE(s: *CpuState) void { // SCASB
     if (rep == REP_REP) {
         while (s.regs[ECX] != 0) {
             const v = memRead8(s, s.regs[EDI]); const al: u8 = @truncate(s.regs[EAX]);
-            updateFlagsArith(s, @as(i64, al) - @as(i64, v), al, v, true);
+            updateFlagsArithW(s, @as(i64, al) - @as(i64, v), al, v, true, .w8);
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + strDir(s));
             s.regs[ECX] -%= 1;
             if (!getFlag(s, ZF_BIT)) break;
@@ -989,14 +1084,14 @@ fn opAE(s: *CpuState) void { // SCASB
     } else if (rep == REP_REPNE) {
         while (s.regs[ECX] != 0) {
             const v = memRead8(s, s.regs[EDI]); const al: u8 = @truncate(s.regs[EAX]);
-            updateFlagsArith(s, @as(i64, al) - @as(i64, v), al, v, true);
+            updateFlagsArithW(s, @as(i64, al) - @as(i64, v), al, v, true, .w8);
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + strDir(s));
             s.regs[ECX] -%= 1;
             if (getFlag(s, ZF_BIT)) break;
         }
     } else {
         const v = memRead8(s, s.regs[EDI]); const al: u8 = @truncate(s.regs[EAX]);
-        updateFlagsArith(s, @as(i64, al) - @as(i64, v), al, v, true);
+        updateFlagsArithW(s, @as(i64, al) - @as(i64, v), al, v, true, .w8);
         s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + strDir(s));
     }
 }
@@ -1007,7 +1102,7 @@ fn opAF(s: *CpuState) void { // SCASD/SCASW
     if (rep == REP_REP) {
         while (s.regs[ECX] != 0) {
             const v: u32 = if (wide) memRead32(s, s.regs[EDI]) else @as(u32, memRead16(s, s.regs[EDI]));
-            updateFlagsArith(s, @as(i64, acc) - @as(i64, v), acc, v, true);
+            updateFlagsArithW(s, @as(i64, acc) - @as(i64, v), acc, v, true, .w32);
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + d);
             s.regs[ECX] -%= 1;
             if (!getFlag(s, ZF_BIT)) break;
@@ -1015,14 +1110,14 @@ fn opAF(s: *CpuState) void { // SCASD/SCASW
     } else if (rep == REP_REPNE) {
         while (s.regs[ECX] != 0) {
             const v: u32 = if (wide) memRead32(s, s.regs[EDI]) else @as(u32, memRead16(s, s.regs[EDI]));
-            updateFlagsArith(s, @as(i64, acc) - @as(i64, v), acc, v, true);
+            updateFlagsArithW(s, @as(i64, acc) - @as(i64, v), acc, v, true, .w32);
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + d);
             s.regs[ECX] -%= 1;
             if (getFlag(s, ZF_BIT)) break;
         }
     } else {
         const v: u32 = if (wide) memRead32(s, s.regs[EDI]) else @as(u32, memRead16(s, s.regs[EDI]));
-        updateFlagsArith(s, @as(i64, acc) - @as(i64, v), acc, v, true);
+        updateFlagsArithW(s, @as(i64, acc) - @as(i64, v), acc, v, true, .w32);
         s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + d);
     }
 }
@@ -1031,7 +1126,7 @@ fn opA6(s: *CpuState) void { // CMPSB
     if (rep == REP_REP) {
         while (s.regs[ECX] != 0) {
             const src = memRead8(s, s.regs[ESI]); const dst = memRead8(s, s.regs[EDI]);
-            updateFlagsArith(s, @as(i64, src) - @as(i64, dst), src, dst, true);
+            updateFlagsArithW(s, @as(i64, src) - @as(i64, dst), src, dst, true, .w8);
             s.regs[ESI] = @bitCast(@as(i32, @bitCast(s.regs[ESI])) + strDir(s));
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + strDir(s));
             s.regs[ECX] -%= 1; if (!getFlag(s, ZF_BIT)) break;
@@ -1039,14 +1134,14 @@ fn opA6(s: *CpuState) void { // CMPSB
     } else if (rep == REP_REPNE) {
         while (s.regs[ECX] != 0) {
             const src = memRead8(s, s.regs[ESI]); const dst = memRead8(s, s.regs[EDI]);
-            updateFlagsArith(s, @as(i64, src) - @as(i64, dst), src, dst, true);
+            updateFlagsArithW(s, @as(i64, src) - @as(i64, dst), src, dst, true, .w8);
             s.regs[ESI] = @bitCast(@as(i32, @bitCast(s.regs[ESI])) + strDir(s));
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + strDir(s));
             s.regs[ECX] -%= 1; if (getFlag(s, ZF_BIT)) break;
         }
     } else {
         const src = memRead8(s, s.regs[ESI]); const dst = memRead8(s, s.regs[EDI]);
-        updateFlagsArith(s, @as(i64, src) - @as(i64, dst), src, dst, true);
+        updateFlagsArithW(s, @as(i64, src) - @as(i64, dst), src, dst, true, .w8);
         s.regs[ESI] = @bitCast(@as(i32, @bitCast(s.regs[ESI])) + strDir(s));
         s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + strDir(s));
     }
@@ -1056,7 +1151,7 @@ fn opA7(s: *CpuState) void { // CMPSD
     if (rep == REP_REP) {
         while (s.regs[ECX] != 0) {
             const src = memRead32(s, s.regs[ESI]); const dst = memRead32(s, s.regs[EDI]);
-            updateFlagsArith(s, @as(i64, src) - @as(i64, dst), src, dst, true);
+            updateFlagsArithW(s, @as(i64, src) - @as(i64, dst), src, dst, true, .w32);
             s.regs[ESI] = @bitCast(@as(i32, @bitCast(s.regs[ESI])) + di);
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + di);
             s.regs[ECX] -%= 1; if (!getFlag(s, ZF_BIT)) break;
@@ -1064,14 +1159,14 @@ fn opA7(s: *CpuState) void { // CMPSD
     } else if (rep == REP_REPNE) {
         while (s.regs[ECX] != 0) {
             const src = memRead32(s, s.regs[ESI]); const dst = memRead32(s, s.regs[EDI]);
-            updateFlagsArith(s, @as(i64, src) - @as(i64, dst), src, dst, true);
+            updateFlagsArithW(s, @as(i64, src) - @as(i64, dst), src, dst, true, .w32);
             s.regs[ESI] = @bitCast(@as(i32, @bitCast(s.regs[ESI])) + di);
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + di);
             s.regs[ECX] -%= 1; if (getFlag(s, ZF_BIT)) break;
         }
     } else {
         const src = memRead32(s, s.regs[ESI]); const dst = memRead32(s, s.regs[EDI]);
-        updateFlagsArith(s, @as(i64, src) - @as(i64, dst), src, dst, true);
+        updateFlagsArithW(s, @as(i64, src) - @as(i64, dst), src, dst, true, .w32);
         s.regs[ESI] = @bitCast(@as(i32, @bitCast(s.regs[ESI])) + di);
         s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + di);
     }
@@ -1082,17 +1177,33 @@ fn opFE(s: *CpuState) void { // Group 4: INC/DEC rm8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     if (d.reg == 0) {
         writeRm8Resolved(s, res.is_reg, res.addr, res.value +% 1);
-        const cf = getFlag(s, CF_BIT); updateFlagsArith(s, @as(i64, res.value) + 1, res.value, 1, false); setFlag(s, CF_BIT, cf);
+        const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, res.value) + 1, res.value, 1, false, .w8); setFlag(s, CF_BIT, cf);
     } else if (d.reg == 1) {
         writeRm8Resolved(s, res.is_reg, res.addr, res.value -% 1);
-        const cf = getFlag(s, CF_BIT); updateFlagsArith(s, @as(i64, res.value) - 1, res.value, 1, true); setFlag(s, CF_BIT, cf);
+        const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, res.value) - 1, res.value, 1, true, .w8); setFlag(s, CF_BIT, cf);
     } else { s.faulted = true; s.halted = true; }
 }
 fn opFF(s: *CpuState) void { // Group 5: INC/DEC/CALL/JMP/PUSH rm32
-    const d = decodeModRM(s); const res = readRm32Resolved(s, d.mod, d.rm);
+    // CALL/JMP/PUSH genuinely always want a fixed-32-bit address/value in
+    // this flat memory model (no meaningful 16-bit near-call form), so `res`
+    // stays a fixed-32 read for those. INC/DEC (/0,/1) DO have a real 16-bit
+    // form under 0x66 -- was hardcoded-32-bit read (readRmFixed32Resolved)
+    // paired with a width-aware write (writeRmvResolved), same shape as the
+    // op01 family; those two cases get their own width-aware read instead.
+    const d = decodeModRM(s); const res = readRmFixed32Resolved(s, d.mod, d.rm);
     switch (d.reg) {
-        0 => { writeRmvResolved(s, res.is_reg, res.addr, res.value +% 1); const cf = getFlag(s, CF_BIT); updateFlagsArith(s, @as(i64, res.value) + 1, res.value, 1, false); setFlag(s, CF_BIT, cf); },
-        1 => { writeRmvResolved(s, res.is_reg, res.addr, res.value -% 1); const cf = getFlag(s, CF_BIT); updateFlagsArith(s, @as(i64, res.value) - 1, res.value, 1, true); setFlag(s, CF_BIT, cf); },
+        0 => {
+            const width: Width = if (s.op_size_ovr) .w16 else .w32;
+            const rv = readRmvResolved(s, d.mod, d.rm);
+            writeRmvResolved(s, rv.is_reg, rv.addr, rv.value +% 1);
+            const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, rv.value) + 1, rv.value, 1, false, width); setFlag(s, CF_BIT, cf);
+        },
+        1 => {
+            const width: Width = if (s.op_size_ovr) .w16 else .w32;
+            const rv = readRmvResolved(s, d.mod, d.rm);
+            writeRmvResolved(s, rv.is_reg, rv.addr, rv.value -% 1);
+            const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, rv.value) - 1, rv.value, 1, true, width); setFlag(s, CF_BIT, cf);
+        },
         2 => { push32(s, s.eip); s.eip = res.value; },  // CALL rm32
         4 => { s.eip = res.value; },                     // JMP rm32
         6 => { push32(s, res.value); },                  // PUSH rm32
@@ -1413,10 +1524,10 @@ test "XOR EAX, EAX zeroes register" {
 // tew-fake-kernel-gaps memory) reported SF=false, when bit 7 of 0xf8 is
 // clearly set. Root cause: op84/opA8/opF6-case0 (TEST) and the 8-bit OR/AND/
 // XOR opcodes (op08/0A/0C, op20/22/24, op30/32, and op80's byte-immediate
-// group1 cases 1/4/6) all called the 32-bit updateFlagsLogic() on a
+// group1 cases 1/4/6) all called the 32-bit updateFlagsLogicW(, .w32) on a
 // zero-extended 8-bit result -- (result & 0x80000000) can never be true for
 // a byte 0x00-0xFF, so SF was always wrong whenever bit 7 of the real 8-bit
-// result was set. Fixed by routing all of them through updateFlagsLogic8()
+// result was set. Fixed by routing all of them through updateFlagsLogicW(, .w8)
 // (already existed, already used correctly by the 8-bit shift group) instead.
 // These tests exercise one opcode per mnemonic family, not all twelve call
 // sites -- the fix is mechanical/identical across all of them.
@@ -1484,6 +1595,246 @@ test "8-bit logic ops still clear SF when bit 7 is not set (no regression the ot
     cpuStep(&s);
     try testing.expect(!getFlag(&s, SF_BIT));
     try testing.expect(!getFlag(&s, ZF_BIT));
+}
+
+// ─── 8-bit arithmetic-op SF/OF regression tests ───────────────────────────────
+// Same discovery, same fix, wider blast radius: updateFlagsArith had no
+// 8-bit sibling at all (unlike updateFlagsLogic8, which existed but wasn't
+// always called) -- every 8-bit ADD/ADC/SBB/SUB/CMP/INC/DEC/NEG/CMPSB/SCASB
+// zero-extended its result into the 32-bit-width SF/OF check, so e.g.
+// ADD AL,1 with AL=0x7f (-> 0x80, a classic INT8 overflow) reported SF=0,
+// OF=0 -- both wrong. One representative test per affected mnemonic, plus
+// a no-overcorrection sanity check, not all 29 call sites individually --
+// the fix is mechanical/identical across all of them (see updateFlagsArith8
+// just above updateFlagsLogic8).
+
+test "ADD AL,imm8 sets SF and OF on the classic 0x7f+1 INT8 overflow" {
+    var mem = [_]u8{0x04, 0x01} ++ [_]u8{0} ** 62; // add al,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x0000007f;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000080), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+    try testing.expect(!getFlag(&s, CF_BIT));
+    try testing.expect(!getFlag(&s, ZF_BIT));
+}
+
+test "SUB AL,imm8 sets SF and CF on 0x00-1 (borrow, result 0xff)" {
+    var mem = [_]u8{0x2C, 0x01} ++ [_]u8{0} ** 62; // sub al,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000000;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x000000ff), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, CF_BIT));
+    try testing.expect(!getFlag(&s, OF_BIT));
+}
+
+test "CMP AL,imm8 sets SF without modifying AL" {
+    var mem = [_]u8{0x3C, 0x01} ++ [_]u8{0} ** 62; // cmp al,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000000;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000000), s.regs[EAX] & 0xFF); // unchanged
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "ADC AL,imm8 sets SF when the carry-in pushes the result past 0x7f" {
+    var mem = [_]u8{0x14, 0x00} ++ [_]u8{0} ** 62; // adc al,0
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x0000007f;
+    setFlag(&s, CF_BIT, true);
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000080), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "SBB AL,imm8 sets SF when the borrow-in pushes the result below 0" {
+    var mem = [_]u8{0x1C, 0x00} ++ [_]u8{0} ** 62; // sbb al,0
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000000;
+    setFlag(&s, CF_BIT, true);
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x000000ff), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "INC rm8 sets SF and OF on 0x7f -> 0x80, leaves CF untouched" {
+    var mem = [_]u8{0xFE, 0xC0} ++ [_]u8{0} ** 62; // inc al
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x0000007f;
+    setFlag(&s, CF_BIT, true); // INC must not touch CF -- verify it's preserved
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000080), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+    try testing.expect(getFlag(&s, CF_BIT)); // preserved, not recomputed
+}
+
+test "DEC rm8 sets OF on 0x80 -> 0x7f (INT8_MIN decrement overflow)" {
+    var mem = [_]u8{0xFE, 0xC8} ++ [_]u8{0} ** 62; // dec al
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000080;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x0000007f), s.regs[EAX] & 0xFF);
+    try testing.expect(!getFlag(&s, SF_BIT)); // 0x7f: bit 7 clear
+    try testing.expect(getFlag(&s, OF_BIT));  // INT8_MIN -> INT8_MAX is the overflow case
+}
+
+test "NEG rm8 sets SF, CF, and OF on the INT8_MIN special case (0x80 negates to itself)" {
+    var mem = [_]u8{0xF6, 0xD8} ++ [_]u8{0} ** 62; // neg al
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000080;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000080), s.regs[EAX] & 0xFF); // -128 wraps to itself
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, CF_BIT)); // NEG of a nonzero value always sets CF
+    try testing.expect(getFlag(&s, OF_BIT));
+}
+
+test "SCASB sets SF when AL-[EDI] has bit 7 set" {
+    var mem = [_]u8{0xAE} ++ [_]u8{0} ** 63; // scasb
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000000;
+    s.regs[EDI] = 10;
+    mem[10] = 0x01; // AL(0) - [EDI](1) = 0xff
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "8-bit arithmetic ops still clear SF/OF when there's no overflow (no regression the other way)" {
+    var mem = [_]u8{0x04, 0x01} ++ [_]u8{0} ** 62; // add al,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000010;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000011), s.regs[EAX] & 0xFF);
+    try testing.expect(!getFlag(&s, SF_BIT));
+    try testing.expect(!getFlag(&s, OF_BIT));
+    try testing.expect(!getFlag(&s, CF_BIT));
+}
+
+// ─── 16-bit (0x66-prefixed) operand-width regression tests ────────────────────
+// Found while planning a full-ISA test suite: several opcodes read an operand
+// via a hardcoded-32-bit helper while writing (or not writing) via a
+// width-aware one that correctly checks op_size_ovr, or in the "r32,rm32"
+// direction family didn't consult op_size_ovr at all. doGroup2 (shift/rotate)
+// had a real memory-corruption risk on top: a 16-bit shift-by-zero on a
+// memory operand wrote 4 bytes instead of 2. All fixed by routing through the
+// already-width-aware readRmv/readRmvResolved/writeRmvResolved family and the
+// new updateFlagsArithW/LogicW width parameter. One representative test per
+// family/direction, not all ~10 call sites individually -- the fix is
+// mechanical/identical across each family (ModRM 0xD8 = mod=11,reg=BX,rm=AX
+// throughout, reused across the ADD/CMP/OR cases below).
+
+test "ADD rmv,rv (0x01) is width-aware: 16-bit AX+BX overflow, upper 16 of EAX preserved" {
+    var mem = [_]u8{0x66, 0x01, 0xD8} ++ [_]u8{0} ** 61; // add ax,bx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x12347FFF; // AX=0x7FFF, upper 16 = sentinel 0x1234
+    s.regs[EBX] = 0x00000001; // BX=1
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12348000), s.regs[EAX]); // AX=0x8000, upper preserved
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+}
+
+test "ADD rv,rmv (0x03) is width-aware: op_size_ovr was never consulted at all before" {
+    var mem = [_]u8{0x66, 0x03, 0xD8} ++ [_]u8{0} ** 61; // add bx,ax
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EBX] = 0x12347FFF; // BX=0x7FFF, upper 16 = sentinel 0x1234
+    s.regs[EAX] = 0x00000001; // AX=1
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12348000), s.regs[EBX]); // BX=0x8000, upper preserved
+    try testing.expectEqual(@as(u32, 0x00000001), s.regs[EAX]); // source untouched
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+}
+
+test "CMP rmv,rv (0x39) is width-aware and does not write back" {
+    var mem = [_]u8{0x66, 0x39, 0xD8} ++ [_]u8{0} ** 61; // cmp ax,bx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000000;
+    s.regs[EBX] = 0x00000001;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000000), s.regs[EAX]); // unchanged
+    try testing.expectEqual(@as(u32, 0x00000001), s.regs[EBX]); // unchanged
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "OR rmv,rv (0x09) is width-aware for both the read and the flag check" {
+    var mem = [_]u8{0x66, 0x09, 0xD8} ++ [_]u8{0} ** 61; // or ax,bx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x12340000; // AX=0, upper 16 = sentinel 0x1234
+    s.regs[EBX] = 0x00008000; // BX=0x8000
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12348000), s.regs[EAX]); // AX=0x8000, upper preserved
+    try testing.expect(getFlag(&s, SF_BIT));
+}
+
+test "TEST rmv,rv (0x85) is width-aware for both the read and the flag check" {
+    var mem = [_]u8{0x66, 0x85, 0xC0} ++ [_]u8{0} ** 61; // test ax,ax
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00008000; // AX=0x8000
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(!getFlag(&s, ZF_BIT));
+}
+
+test "XADD (0x0F 0xC1) is width-aware on both operands, not just the write" {
+    var mem = [_]u8{0x66, 0x0F, 0xC1, 0xD8} ++ [_]u8{0} ** 60; // xadd ax,bx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x12347FFF; // AX=0x7FFF, upper 16 = sentinel 0x1234
+    s.regs[EBX] = 0x00000001; // BX=1
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12348000), s.regs[EAX]); // AX = 0x7FFF+1, upper preserved
+    try testing.expectEqual(@as(u32, 0x00007FFF), s.regs[EBX]); // BX = old AX
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+}
+
+test "INC rm32 Group5 (0xFF /0) is width-aware: 16-bit 0x7FFF+1 overflow" {
+    var mem = [_]u8{0x66, 0xFF, 0xC0} ++ [_]u8{0} ** 61; // inc ax
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x12347FFF; // AX=0x7FFF, upper 16 = sentinel 0x1234
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12348000), s.regs[EAX]);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+}
+
+test "doGroup2 memory-corruption regression: 16-bit shift-by-zero writes only 2 bytes, not 4" {
+    // shl word ptr [0x00000020], cl -- with CL=0, hits the count==0
+    // early-return path, which used to write via the hardcoded-32-bit
+    // writeRmFixed32Resolved regardless of op_size_ovr.
+    var mem = [_]u8{ 0x66, 0xD3, 0x25, 0x20, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 57;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ECX] = 0; // shift count 0
+    mem[0x20] = 0x34;
+    mem[0x21] = 0x12; // target 16-bit word = 0x1234
+    mem[0x22] = 0xAA; // sentinel byte immediately after the 2-byte operand
+    cpuStep(&s);
+    try testing.expectEqual(@as(u8, 0x34), mem[0x20]);
+    try testing.expectEqual(@as(u8, 0x12), mem[0x21]);
+    try testing.expectEqual(@as(u8, 0xAA), mem[0x22]); // must be untouched
+}
+
+test "doGroup2 ROL AX,1 wraps within 16 bits, not 32" {
+    var mem = [_]u8{0x66, 0xD1, 0xC0} ++ [_]u8{0} ** 61; // rol ax,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00008001;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000003), s.regs[EAX] & 0xFFFF);
+}
+
+test "doGroup2 SAR AX,1 sign-extends within 16 bits, not 32" {
+    var mem = [_]u8{0x66, 0xD1, 0xF8} ++ [_]u8{0} ** 61; // sar ax,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00008000;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x0000C000), s.regs[EAX] & 0xFFFF);
 }
 
 // ─── Public C ABI tests ───────────────────────────────────────────────────────

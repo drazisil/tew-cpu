@@ -180,42 +180,63 @@ pub inline fn getFlag(s: *CpuState, bit: u5) bool { return ((s.eflags >> bit) & 
 pub inline fn setFlag(s: *CpuState, bit: u5, v: bool) void {
     if (v) s.eflags |= @as(u32, 1) << bit else s.eflags &= ~(@as(u32, 1) << bit);
 }
-pub fn updateFlagsArith(s: *CpuState, result_raw: i64, op1: u32, op2: u32, is_sub: bool) void {
-    const r32: u32 = @truncate(@as(u64, @bitCast(result_raw)));
-    setFlag(s, ZF_BIT, r32 == 0);
-    setFlag(s, SF_BIT, (r32 & 0x80000000) != 0);
-    var p: u8 = @truncate(r32);
+// Operand width for the flag functions below. Consolidated 2026-07 after the
+// same bug shape (a result zero-extended into a wider-than-actual flag check)
+// was found and fixed twice independently for 8-bit logic and 8-bit
+// arithmetic ops -- a width *parameter* makes the mistake visible at the call
+// site instead of relying on remembering to call the right same-named-but-
+// different sibling function.
+pub const Width = enum { w8, w16, w32 };
+
+fn widthMask(width: Width) u32 {
+    return switch (width) {
+        .w8 => 0xFF,
+        .w16 => 0xFFFF,
+        .w32 => 0xFFFFFFFF,
+    };
+}
+
+fn widthSignBit(width: Width) u32 {
+    return switch (width) {
+        .w8 => 0x80,
+        .w16 => 0x8000,
+        .w32 => 0x80000000,
+    };
+}
+
+pub fn updateFlagsArithW(s: *CpuState, result_raw: i64, op1: anytype, op2: anytype, is_sub: bool, width: Width) void {
+    const mask = widthMask(width);
+    const sign_bit = widthSignBit(width);
+    const r: u32 = @as(u32, @truncate(@as(u64, @bitCast(result_raw)))) & mask;
+    const o1: u32 = @as(u32, op1) & mask;
+    const o2: u32 = @as(u32, op2) & mask;
+    setFlag(s, ZF_BIT, r == 0);
+    setFlag(s, SF_BIT, (r & sign_bit) != 0);
+    var p: u8 = @truncate(r);
     p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
     if (is_sub) {
-        setFlag(s, CF_BIT, op1 < op2);
+        setFlag(s, CF_BIT, o1 < o2);
     } else {
-        setFlag(s, CF_BIT, r32 < op1 or r32 < op2);
+        setFlag(s, CF_BIT, r < o1 or r < o2);
     }
-    const s1 = (op1 & 0x80000000) != 0;
-    const s2 = (op2 & 0x80000000) != 0;
-    const sr = (r32 & 0x80000000) != 0;
+    const s1 = (o1 & sign_bit) != 0;
+    const s2 = (o2 & sign_bit) != 0;
+    const sr = (r & sign_bit) != 0;
     if (is_sub) {
         setFlag(s, OF_BIT, s1 != s2 and sr != s1);
     } else {
         setFlag(s, OF_BIT, s1 == s2 and sr != s1);
     }
 }
-pub fn updateFlagsLogic(s: *CpuState, result: u32) void {
-    setFlag(s, ZF_BIT, result == 0);
-    setFlag(s, SF_BIT, (result & 0x80000000) != 0);
+
+pub fn updateFlagsLogicW(s: *CpuState, result: anytype, width: Width) void {
+    const r: u32 = @as(u32, result) & widthMask(width);
+    setFlag(s, ZF_BIT, r == 0);
+    setFlag(s, SF_BIT, (r & widthSignBit(width)) != 0);
     setFlag(s, CF_BIT, false);
     setFlag(s, OF_BIT, false);
-    var p: u8 = @truncate(result);
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
-    setFlag(s, PF_BIT, (p & 1) == 0);
-}
-pub fn updateFlagsLogic8(s: *CpuState, result: u8) void {
-    setFlag(s, ZF_BIT, result == 0);
-    setFlag(s, SF_BIT, (result & 0x80) != 0);
-    setFlag(s, CF_BIT, false);
-    setFlag(s, OF_BIT, false);
-    var p: u8 = result;
+    var p: u8 = @truncate(r);
     p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
 }
@@ -311,21 +332,30 @@ pub fn readRm8Resolved(s: *CpuState, mod: u8, rm: u8) Rm8Result {
 pub fn writeRm8Resolved(s: *CpuState, is_reg: bool, addr: u32, v: u8) void {
     if (is_reg) writeReg8(s, @truncate(addr), v) else memWrite8(s, addr, v);
 }
-pub fn readRm32(s: *CpuState, mod: u8, rm: u8) u32 {
+// Always reads/writes 32 bits regardless of `op_size_ovr` (the 0x66 prefix).
+// Use only where the operand is genuinely always 32-bit (e.g. LEA's address,
+// IMUL's fixed-width forms, INC/DEC r32). For anything with a `v`-suffixed
+// mnemonic (rmv, immv, eAX) or an explicit "under 0x66 this is 16-bit" case,
+// use the `Rmv*` family (readRmv/writeRmv/readRmvResolved/writeRmvResolved)
+// instead -- mixing these two families up (reading via one, writing via the
+// other) is exactly the shape of bug this naming is meant to make visible at
+// the call site; see tew-fake-kernel-gaps memory / the cpu.zig ISA-test-suite
+// planning pass for the confirmed instances this fixed.
+pub fn readRmFixed32(s: *CpuState, mod: u8, rm: u8) u32 {
     const r = resolveRm(s, mod, rm);
     return if (r.is_reg) s.regs[r.addr] else memRead32(s, applySegOvr(s, r.addr));
 }
-pub fn writeRm32(s: *CpuState, mod: u8, rm: u8, v: u32) void {
+pub fn writeRmFixed32(s: *CpuState, mod: u8, rm: u8, v: u32) void {
     const r = resolveRm(s, mod, rm);
     if (r.is_reg) s.regs[r.addr] = v else memWrite32(s, applySegOvr(s, r.addr), v);
 }
-pub fn readRm32Resolved(s: *CpuState, mod: u8, rm: u8) Rm32Result {
+pub fn readRmFixed32Resolved(s: *CpuState, mod: u8, rm: u8) Rm32Result {
     const r = resolveRm(s, mod, rm);
     const addr = if (r.is_reg) r.addr else applySegOvr(s, r.addr);
     const v: u32 = if (r.is_reg) s.regs[r.addr] else memRead32(s, addr);
     return .{ .value = v, .is_reg = r.is_reg, .addr = addr };
 }
-pub fn writeRm32Resolved(s: *CpuState, is_reg: bool, addr: u32, v: u32) void {
+pub fn writeRmFixed32Resolved(s: *CpuState, is_reg: bool, addr: u32, v: u32) void {
     if (is_reg) s.regs[addr] = v else memWrite32(s, addr, v);
 }
 pub fn readRmv(s: *CpuState, mod: u8, rm: u8) u32 {

@@ -36,7 +36,7 @@ pub fn op0F(s: *CpuState) void {
         0xAF => { // IMUL r32, rm32
             const d = core.decodeModRM(s);
             const imul_op1: i64 = @as(i32, @bitCast(s.regs[d.reg]));
-            const imul_op2: i64 = @as(i32, @bitCast(core.readRm32(s, d.mod, d.rm)));
+            const imul_op2: i64 = @as(i32, @bitCast(core.readRmFixed32(s, d.mod, d.rm)));
             const r32: u32 = @truncate(@as(u64, @bitCast(imul_op1 * imul_op2)));
             s.regs[d.reg] = r32;
             const ov = (imul_op1 * imul_op2) != @as(i64, @as(i32, @bitCast(r32)));
@@ -52,23 +52,30 @@ pub fn op0F(s: *CpuState) void {
             const rel = core.fetchS32(s);
             if (core.evalCond(s, op2 & 0xF)) s.eip = s.eip +% @as(u32, @bitCast(rel));
         },
-        0xC1 => { // XADD rm32, r32
-            const d = core.decodeModRM(s); const dst = core.readRm32(s, d.mod, d.rm); const src = s.regs[d.reg];
-            s.regs[d.reg] = dst; core.writeRm32(s, d.mod, d.rm, dst +% src);
-            core.updateFlagsArith(s, @as(i64, dst) + @as(i64, src), dst, src, false);
+        0xC1 => { // XADD rmv, rv -- was hardcoded 32-bit throughout, ignoring
+            // 0x66 (op_size_ovr); now width-aware on both the rm operand and
+            // the register operand, matching op8B's MOV rv,rmv pattern.
+            const d = core.decodeModRM(s);
+            const width: core.Width = if (s.op_size_ovr) .w16 else .w32;
+            const dst = core.readRmv(s, d.mod, d.rm);
+            const src = if (s.op_size_ovr) s.regs[d.reg] & 0xFFFF else s.regs[d.reg];
+            if (s.op_size_ovr) s.regs[d.reg] = (s.regs[d.reg] & 0xFFFF0000) | (dst & 0xFFFF)
+            else s.regs[d.reg] = dst;
+            core.writeRmv(s, d.mod, d.rm, dst +% src);
+            core.updateFlagsArithW(s, @as(i64, dst) + @as(i64, src), dst, src, false, width);
         },
         0xBD => { // BSR r32, rm32
-            const d = core.decodeModRM(s); const v = core.readRm32(s, d.mod, d.rm);
+            const d = core.decodeModRM(s); const v = core.readRmFixed32(s, d.mod, d.rm);
             if (v == 0) core.setFlag(s, ZF_BIT, true)
             else { core.setFlag(s, ZF_BIT, false); s.regs[d.reg] = 31 - @clz(v); }
         },
         0xBC => { // BSF r32, rm32
-            const d = core.decodeModRM(s); const v = core.readRm32(s, d.mod, d.rm);
+            const d = core.decodeModRM(s); const v = core.readRmFixed32(s, d.mod, d.rm);
             if (v == 0) core.setFlag(s, ZF_BIT, true)
             else { core.setFlag(s, ZF_BIT, false); s.regs[d.reg] = @ctz(v); }
         },
         0x40...0x4F => { // CMOVcc r32, rm32
-            const d = core.decodeModRM(s); const v = core.readRm32(s, d.mod, d.rm);
+            const d = core.decodeModRM(s); const v = core.readRmFixed32(s, d.mod, d.rm);
             if (core.evalCond(s, op2 & 0xF)) s.regs[d.reg] = v;
         },
         0xC8...0xCF => { // BSWAP r32
@@ -77,15 +84,15 @@ pub fn op0F(s: *CpuState) void {
         },
         0xA3 => { // BT rm32, r32
             const d = core.decodeModRM(s); const bit: u5 = @truncate(s.regs[d.reg] & 0x1F);
-            core.setFlag(s, CF_BIT, ((core.readRm32(s, d.mod, d.rm) >> bit) & 1) != 0);
+            core.setFlag(s, CF_BIT, ((core.readRmFixed32(s, d.mod, d.rm) >> bit) & 1) != 0);
         },
         0xBA => { // Group 8: BT/BTS/BTR/BTC rm32, imm8
             const d = core.decodeModRM(s); const bit: u5 = @truncate(core.fetch8(s) & 0x1F);
-            const v = core.readRm32(s, d.mod, d.rm); core.setFlag(s, CF_BIT, ((v >> bit) & 1) != 0);
+            const v = core.readRmFixed32(s, d.mod, d.rm); core.setFlag(s, CF_BIT, ((v >> bit) & 1) != 0);
             switch (d.reg) {
-                5 => core.writeRm32(s, d.mod, d.rm, v | (@as(u32, 1) << bit)),
-                6 => core.writeRm32(s, d.mod, d.rm, v & ~(@as(u32, 1) << bit)),
-                7 => core.writeRm32(s, d.mod, d.rm, (v ^ (@as(u32, 1) << bit))),
+                5 => core.writeRmFixed32(s, d.mod, d.rm, v | (@as(u32, 1) << bit)),
+                6 => core.writeRmFixed32(s, d.mod, d.rm, v & ~(@as(u32, 1) << bit)),
+                7 => core.writeRmFixed32(s, d.mod, d.rm, (v ^ (@as(u32, 1) << bit))),
                 else => {},
             }
         },
