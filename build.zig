@@ -36,4 +36,11 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    // `zig build test` alone doesn't touch zig-out/lib/libcpu.so -- only the
+    // default install step does. Bitten by this twice (a fix compiled and
+    // its tests passed, but tew/hardware/cpu_zig.py's ctypes binding kept
+    // loading the stale pre-fix .so, since nothing had rebuilt it): make
+    // `test` also depend on install, so the real artifact is always current
+    // whenever tests are run, not just on a separate plain `zig build`.
+    test_step.dependOn(b.getInstallStep());
 }
