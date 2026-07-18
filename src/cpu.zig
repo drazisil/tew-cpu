@@ -1184,25 +1184,31 @@ fn opFE(s: *CpuState) void { // Group 4: INC/DEC rm8
     } else { s.faulted = true; s.halted = true; }
 }
 fn opFF(s: *CpuState) void { // Group 5: INC/DEC/CALL/JMP/PUSH rm32
-    // CALL/JMP/PUSH genuinely always want a fixed-32-bit address/value in
-    // this flat memory model (no meaningful 16-bit near-call form), so `res`
-    // stays a fixed-32 read for those. INC/DEC (/0,/1) DO have a real 16-bit
-    // form under 0x66 -- was hardcoded-32-bit read (readRmFixed32Resolved)
-    // paired with a width-aware write (writeRmvResolved), same shape as the
-    // op01 family; those two cases get their own width-aware read instead.
+    // decodeModRM+readRmFixed32Resolved must run exactly ONCE per instruction:
+    // for a memory operand with a displacement/SIB, resolveRm() itself calls
+    // fetch32/fetch8 to consume those trailing bytes and advances s.eip past
+    // them. Calling a second Resolved helper here (as INC/DEC used to, to get
+    // a width-aware read) re-fetches the same trailing bytes a second time,
+    // overshooting EIP by the displacement's size -- confirmed live via
+    // MCity_d.exe/authlogin.dll: `ff 05 <disp32>` (INC dword ptr [disp32])
+    // landed EIP 4 bytes past the correct next instruction and faulted.
+    // CALL/JMP/PUSH want the fixed-32 value/address as-is; INC/DEC derive
+    // their width-aware value by masking `res.value` instead of re-resolving
+    // -- resolveRm never consults op_size_ovr, so res.is_reg/res.addr are
+    // identical to what a second Rmv-resolve would have produced anyway.
     const d = decodeModRM(s); const res = readRmFixed32Resolved(s, d.mod, d.rm);
     switch (d.reg) {
         0 => {
             const width: Width = if (s.op_size_ovr) .w16 else .w32;
-            const rv = readRmvResolved(s, d.mod, d.rm);
-            writeRmvResolved(s, rv.is_reg, rv.addr, rv.value +% 1);
-            const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, rv.value) + 1, rv.value, 1, false, width); setFlag(s, CF_BIT, cf);
+            const rv_value: u32 = if (s.op_size_ovr) res.value & 0xFFFF else res.value;
+            writeRmvResolved(s, res.is_reg, res.addr, rv_value +% 1);
+            const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, rv_value) + 1, rv_value, 1, false, width); setFlag(s, CF_BIT, cf);
         },
         1 => {
             const width: Width = if (s.op_size_ovr) .w16 else .w32;
-            const rv = readRmvResolved(s, d.mod, d.rm);
-            writeRmvResolved(s, rv.is_reg, rv.addr, rv.value -% 1);
-            const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, rv.value) - 1, rv.value, 1, true, width); setFlag(s, CF_BIT, cf);
+            const rv_value: u32 = if (s.op_size_ovr) res.value & 0xFFFF else res.value;
+            writeRmvResolved(s, res.is_reg, res.addr, rv_value -% 1);
+            const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, rv_value) - 1, rv_value, 1, true, width); setFlag(s, CF_BIT, cf);
         },
         2 => { push32(s, s.eip); s.eip = res.value; },  // CALL rm32
         4 => { s.eip = res.value; },                     // JMP rm32
@@ -1801,6 +1807,65 @@ test "INC rm32 Group5 (0xFF /0) is width-aware: 16-bit 0x7FFF+1 overflow" {
     s.regs[EAX] = 0x12347FFF; // AX=0x7FFF, upper 16 = sentinel 0x1234
     cpuStep(&s);
     try testing.expectEqual(@as(u32, 0x12348000), s.regs[EAX]);
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+}
+
+test "INC dword ptr [disp32] (Group5 0xFF /0) advances EIP by 6, not 10 (regression: resolveRm's fetch32 consumed the disp32 twice)" {
+    // Live-confirmed regression: authlogin.dll's SBH allocator does
+    // `inc dword ptr ds:0x1000dbb8` (ff 05 <disp32>, no 0x66 prefix -- this
+    // bug is NOT width-gated). opFF used to call a *second* Resolved helper
+    // for INC/DEC after the upfront readRmFixed32Resolved, and resolveRm()
+    // itself does fetch32() for mod=00,rm=101 (disp32-only) addressing --
+    // so the displacement got fetched twice, landing EIP 4 bytes past the
+    // real next instruction and decoding garbage there.
+    var mem = [_]u8{ 0xFF, 0x05, 0x10, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 58; // inc dword ptr [0x10]
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    mem[0x10] = 5; mem[0x11] = 0; mem[0x12] = 0; mem[0x13] = 0;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 6), s.eip);
+    try testing.expectEqual(@as(u8, 6), mem[0x10]);
+}
+
+test "DEC dword ptr [disp32] (Group5 0xFF /1) advances EIP by 6, not 10" {
+    var mem = [_]u8{ 0xFF, 0x0D, 0x10, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 58; // dec dword ptr [0x10]
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    mem[0x10] = 5; mem[0x11] = 0; mem[0x12] = 0; mem[0x13] = 0;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 6), s.eip);
+    try testing.expectEqual(@as(u8, 4), mem[0x10]);
+}
+
+test "INC word ptr [disp32] under 0x66 advances EIP by 7 and only writes 2 bytes" {
+    var mem = [_]u8{ 0x66, 0xFF, 0x05, 0x10, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 57; // inc word ptr [0x10]
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    mem[0x10] = 0xFF; mem[0x11] = 0x7F; mem[0x12] = 0xAA; // sentinel byte after the 16-bit operand
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 7), s.eip);
+    try testing.expectEqual(@as(u8, 0x00), mem[0x10]);
+    try testing.expectEqual(@as(u8, 0x80), mem[0x11]);
+    try testing.expectEqual(@as(u8, 0xAA), mem[0x12]); // must be untouched
+    try testing.expect(getFlag(&s, SF_BIT));
+    try testing.expect(getFlag(&s, OF_BIT));
+}
+
+test "INC dword ptr [disp8] (Group5 0xFF /0) advances EIP by 3, not 7" {
+    var mem = [_]u8{ 0xFF, 0x45, 0x10 } ++ [_]u8{0} ** 61; // inc dword ptr [ebp+0x10]
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EBP] = 0;
+    mem[0x10] = 5; mem[0x11] = 0; mem[0x12] = 0; mem[0x13] = 0;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 3), s.eip);
+    try testing.expectEqual(@as(u8, 6), mem[0x10]);
+}
+
+test "INC ECX (Group5 0xFF /0, register-direct) still works after the resolveRm double-fetch fix" {
+    var mem = [_]u8{0xFF, 0xC1} ++ [_]u8{0} ** 62; // inc ecx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ECX] = 0x7FFFFFFF;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 2), s.eip);
+    try testing.expectEqual(@as(u32, 0x80000000), s.regs[ECX]);
     try testing.expect(getFlag(&s, SF_BIT));
     try testing.expect(getFlag(&s, OF_BIT));
 }
