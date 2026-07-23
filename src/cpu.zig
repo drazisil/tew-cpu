@@ -1316,7 +1316,7 @@ export fn cpu_destroy(s: *CpuState) void { std.heap.c_allocator.destroy(s); }
 export fn cpu_set_int_handler(s: *CpuState, handler: IntHandlerFn) void { s.int_handler = handler; }
 pub export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
     var i: u64 = 0;
-    while (!s.halted and i < max_steps) : (i += 1) {
+    while (!s.halted and !s.fatal_halted and i < max_steps) : (i += 1) {
         const eip = s.eip;
         // Logpoints: fire inline C callback, no halt.
         for (0..8) |j| {
@@ -1352,15 +1352,38 @@ pub export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
     return .step_limit;
 }
 export fn cpu_get_reg(s: *CpuState, idx: u32) u32 { return if (idx < 8) s.regs[idx] else 0; }
-export fn cpu_set_reg(s: *CpuState, idx: u32, val: u32) void { if (idx < 8) s.regs[idx] = val; }
+export fn cpu_set_reg(s: *CpuState, idx: u32, val: u32) void {
+    if (s.fatal_halted) return;
+    if (idx < 8) s.regs[idx] = val;
+}
 export fn cpu_get_eip(s: *CpuState) u32 { return s.eip; }
-export fn cpu_set_eip(s: *CpuState, val: u32) void { s.eip = val; }
+export fn cpu_set_eip(s: *CpuState, val: u32) void {
+    if (s.fatal_halted) return;
+    s.eip = val;
+}
 export fn cpu_get_eflags(s: *CpuState) u32 { return s.eflags; }
-export fn cpu_set_eflags(s: *CpuState, val: u32) void { s.eflags = val; }
+export fn cpu_set_eflags(s: *CpuState, val: u32) void {
+    if (s.fatal_halted) return;
+    s.eflags = val;
+}
 export fn cpu_is_halted(s: *CpuState) bool { return s.halted; }
 export fn cpu_is_faulted(s: *CpuState) bool { return s.faulted; }
 export fn cpu_set_halted(s: *CpuState) void { s.halted = true; }
-export fn cpu_clear_halted(s: *CpuState) void { s.halted = false; s.faulted = false; }
+export fn cpu_clear_halted(s: *CpuState) void {
+    if (s.fatal_halted) return;
+    s.halted = false;
+    s.faulted = false;
+}
+// Fatal halt: the emulator (not real x86) hit something it cannot simulate.
+// Permanent -- no clear function exists on purpose. Reuses the real halt
+// mechanism as its terminal action (cpu_run's loop already stops on
+// s.halted), and additionally sets s.fatal_halted so cpu_clear_halted and
+// every register/eflags/FPU setter above refuse to touch state afterward.
+export fn cpu_set_fatal_halt(s: *CpuState) void {
+    s.fatal_halted = true;
+    s.halted = true;
+}
+export fn cpu_is_fatal_halted(s: *CpuState) bool { return s.fatal_halted; }
 export fn cpu_get_step_count(s: *CpuState) u64 { return s.step_count; }
 export fn cpu_get_run_id(s: *CpuState) u64 { return s.run_id; }
 export fn cpu_get_last_opcode(s: *CpuState) u8 { return s.last_opcode; }
@@ -1370,15 +1393,30 @@ export fn cpu_get_fs_base(s: *CpuState) u32 { return s.fs_base; }
 export fn cpu_get_gs_base(s: *CpuState) u32 { return s.gs_base; }
 // fpu_stack is f80 — narrow to f64 for the C API.
 export fn cpu_fpu_get(s: *CpuState, i: u32) f64 { return if (i < 8) @floatCast(s.fpu_stack[i]) else 0.0; }
-export fn cpu_fpu_set(s: *CpuState, i: u32, val: f64) void { if (i < 8) s.fpu_stack[i] = @floatCast(val); }
+export fn cpu_fpu_set(s: *CpuState, i: u32, val: f64) void {
+    if (s.fatal_halted) return;
+    if (i < 8) s.fpu_stack[i] = @floatCast(val);
+}
 export fn cpu_fpu_get_top(s: *CpuState) u32 { return s.fpu_top; }
-export fn cpu_fpu_set_top(s: *CpuState, val: u32) void { s.fpu_top = val & 7; }
+export fn cpu_fpu_set_top(s: *CpuState, val: u32) void {
+    if (s.fatal_halted) return;
+    s.fpu_top = val & 7;
+}
 export fn cpu_fpu_get_status(s: *CpuState) u16 { return s.fpu_status_word; }
-export fn cpu_fpu_set_status(s: *CpuState, val: u16) void { s.fpu_status_word = val; }
+export fn cpu_fpu_set_status(s: *CpuState, val: u16) void {
+    if (s.fatal_halted) return;
+    s.fpu_status_word = val;
+}
 export fn cpu_fpu_get_control(s: *CpuState) u16 { return s.fpu_control_word; }
-export fn cpu_fpu_set_control(s: *CpuState, val: u16) void { s.fpu_control_word = val; }
+export fn cpu_fpu_set_control(s: *CpuState, val: u16) void {
+    if (s.fatal_halted) return;
+    s.fpu_control_word = val;
+}
 export fn cpu_fpu_get_tag(s: *CpuState) u16 { return s.fpu_tag_word; }
-export fn cpu_fpu_set_tag(s: *CpuState, val: u16) void { s.fpu_tag_word = val; }
+export fn cpu_fpu_set_tag(s: *CpuState, val: u16) void {
+    if (s.fatal_halted) return;
+    s.fpu_tag_word = val;
+}
 export fn cpu_set_watchpoint(s: *CpuState, addr: u32) void { s.watchpoint = addr; s.watchpoint_hit = false; }
 export fn cpu_clear_watchpoint(s: *CpuState) void { s.watchpoint = 0; s.watchpoint_hit = false; }
 export fn cpu_watchpoint_hit(s: *CpuState) bool { return s.watchpoint_hit; }

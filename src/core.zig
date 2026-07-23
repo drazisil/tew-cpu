@@ -67,6 +67,14 @@ pub const CpuState = struct {
     mmx_regs: [8]u64 = .{0} ** 8,
     halted: bool = false,
     faulted: bool = false,
+    // Set only via cpu_set_fatal_halt -- means the emulator hit something it
+    // cannot simulate (e.g. an unimplemented Win32 API), not a real x86
+    // condition. Once true, permanent for the lifetime of this CpuState:
+    // cpu_clear_halted refuses to clear halted/faulted, cpu_run's loop
+    // refuses to execute another instruction, and every register/eflags/FPU
+    // setter refuses to write -- a genuine single-core lockup, not something
+    // any later scheduling or state-restore code can undo.
+    fatal_halted: bool = false,
     fs_base: u32 = 0,
     gs_base: u32 = 0,
     step_count: u64 = 0,
