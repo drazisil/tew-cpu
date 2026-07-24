@@ -320,7 +320,7 @@ test "RegKey alignment: each regs[] index maps to the correct RegKey" {
 // doesn't exist in this core, so this drives cpu_run/CpuState directly
 // (both now `pub`, see cpu.zig).
 test "step-number consistency: a single instruction's MemEvents and RegEvent share the same step" {
-    const cpu_mod = @import("../cpu.zig");
+    const cpu_mod = @import("../kernel.zig");
 
     var mem = [_]u8{0x50} ++ [_]u8{0} ** 63; // push eax
     var s = cpu_core.CpuState{ .memory = &mem, .memory_size = mem.len };
@@ -350,7 +350,7 @@ test "step-number consistency: a single instruction's MemEvents and RegEvent sha
 // since this core has no such helper: push ebp; mov ebp,esp; mov eax,0x2a;
 // ret.
 test "end-to-end: real hooks capture push/mov/mov/ret exactly" {
-    const cpu_mod = @import("../cpu.zig");
+    const cpu_mod = @import("../kernel.zig");
 
     const code = [_]u8{ 0x55, 0x89, 0xE5, 0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3 };
     var mem = code ++ [_]u8{0} ** (512 - code.len);
