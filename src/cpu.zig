@@ -1,10 +1,32 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // cpu.zig — One-byte opcode handlers, dispatch table, execution engine, C API.
 // Shared types/helpers live in core.zig. FPU ops in fpu.zig. 0x0F ops in two_byte.zig.
+// Standalone bounds-checked buffer access (for non-CPU-bound callers) in memory.zig.
 const std = @import("std");
 const core = @import("core.zig");
 const fpu = @import("fpu.zig");
 const two_byte = @import("two_byte.zig");
+const memory_zig = @import("memory.zig");
+// memory.zig's export fns are never called from cpu.zig itself (they're a
+// standalone C ABI for non-CPU-bound callers) -- so unlike fpu/two_byte,
+// nothing here naturally references them. Without this block, Zig's lazy
+// per-declaration analysis never touches them and the dynamic lib build
+// silently drops them (confirmed via `nm -D`: `zig build test` still finds
+// and runs their `test` blocks either way, since test discovery walks the
+// whole import graph regardless of usage, but that doesn't emit symbols).
+comptime {
+    _ = &memory_zig.mem_read8;
+    _ = &memory_zig.mem_read_signed8;
+    _ = &memory_zig.mem_write8;
+    _ = &memory_zig.mem_read16;
+    _ = &memory_zig.mem_write16;
+    _ = &memory_zig.mem_read32;
+    _ = &memory_zig.mem_read_signed32;
+    _ = &memory_zig.mem_write32;
+    _ = &memory_zig.mem_load;
+    _ = &memory_zig.mem_is_valid_address;
+    _ = &memory_zig.mem_is_valid_range;
+}
 
 // ─── Type and constant aliases from core ────────────────────────────────────
 // CpuState/RunResult are `pub` -- unlike the rest of these aliases -- so an
