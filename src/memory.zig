@@ -8,16 +8,16 @@
 // still get bounds-checked reads/writes against the same underlying buffer.
 // Failure is reported via a `bool` return instead of CpuState.faulted/halted,
 // since there is no CPU here to fault.
+//
+// The raw bounds-check/byte-access arithmetic itself lives in primitives.zig,
+// shared with core.zig's CpuState-bound memRead8/memWrite8 -- this file only
+// owns the bool-return C-ABI shape around those primitives.
 const std = @import("std");
-
-inline fn inBounds(size: usize, addr: u32, width: u32) bool {
-    const end = @as(u64, addr) + @as(u64, width);
-    return end <= size;
-}
+const primitives = @import("primitives.zig");
 
 pub export fn mem_read8(ptr: [*]const u8, size: usize, addr: u32, out: *u8) bool {
-    if (!inBounds(size, addr, 1)) return false;
-    out.* = ptr[addr];
+    if (!primitives.inBounds1(size, addr)) return false;
+    out.* = primitives.readByte(ptr, addr);
     return true;
 }
 pub export fn mem_read_signed8(ptr: [*]const u8, size: usize, addr: u32, out: *i8) bool {
@@ -27,25 +27,25 @@ pub export fn mem_read_signed8(ptr: [*]const u8, size: usize, addr: u32, out: *i
     return true;
 }
 pub export fn mem_write8(ptr: [*]u8, size: usize, addr: u32, val: u8) bool {
-    if (!inBounds(size, addr, 1)) return false;
-    ptr[addr] = val;
+    if (!primitives.inBounds1(size, addr)) return false;
+    primitives.writeByte(ptr, addr, val);
     return true;
 }
 
 pub export fn mem_read16(ptr: [*]const u8, size: usize, addr: u32, out: *u16) bool {
-    if (!inBounds(size, addr, 2)) return false;
+    if (!primitives.inBoundsWidth(size, addr, 2)) return false;
     out.* = @as(u16, ptr[addr]) | (@as(u16, ptr[addr + 1]) << 8);
     return true;
 }
 pub export fn mem_write16(ptr: [*]u8, size: usize, addr: u32, val: u16) bool {
-    if (!inBounds(size, addr, 2)) return false;
+    if (!primitives.inBoundsWidth(size, addr, 2)) return false;
     ptr[addr] = @truncate(val);
     ptr[addr + 1] = @truncate(val >> 8);
     return true;
 }
 
 pub export fn mem_read32(ptr: [*]const u8, size: usize, addr: u32, out: *u32) bool {
-    if (!inBounds(size, addr, 4)) return false;
+    if (!primitives.inBoundsWidth(size, addr, 4)) return false;
     out.* = @as(u32, ptr[addr]) | (@as(u32, ptr[addr + 1]) << 8) |
         (@as(u32, ptr[addr + 2]) << 16) | (@as(u32, ptr[addr + 3]) << 24);
     return true;
@@ -57,7 +57,7 @@ pub export fn mem_read_signed32(ptr: [*]const u8, size: usize, addr: u32, out: *
     return true;
 }
 pub export fn mem_write32(ptr: [*]u8, size: usize, addr: u32, val: u32) bool {
-    if (!inBounds(size, addr, 4)) return false;
+    if (!primitives.inBoundsWidth(size, addr, 4)) return false;
     ptr[addr] = @truncate(val);
     ptr[addr + 1] = @truncate(val >> 8);
     ptr[addr + 2] = @truncate(val >> 16);
@@ -66,16 +66,16 @@ pub export fn mem_write32(ptr: [*]u8, size: usize, addr: u32, val: u32) bool {
 }
 
 pub export fn mem_load(ptr: [*]u8, size: usize, addr: u32, data: [*]const u8, data_len: usize) bool {
-    if (!inBounds(size, addr, @intCast(data_len))) return false;
+    if (!primitives.inBoundsWidth(size, addr, @intCast(data_len))) return false;
     @memcpy(ptr[addr .. addr + data_len], data[0..data_len]);
     return true;
 }
 
 pub export fn mem_is_valid_address(size: usize, addr: u32) bool {
-    return inBounds(size, addr, 1);
+    return primitives.inBounds1(size, addr);
 }
 pub export fn mem_is_valid_range(size: usize, addr: u32, range_size: usize) bool {
-    return inBounds(size, addr, @intCast(range_size));
+    return primitives.inBoundsWidth(size, addr, @intCast(range_size));
 }
 
 const testing = std.testing;

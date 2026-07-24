@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // core.zig — CpuState definition and all shared helpers.
-// Imported by every opcode module; no imports from our own modules here.
+// Imported by every opcode module. The one exception to "no imports from our
+// own modules here" is primitives.zig, which has no imports of its own (not
+// even this file) -- memRead8/memWrite8 delegate their raw bounds-check/
+// byte-access arithmetic to it so that logic has exactly one implementation,
+// shared with memory.zig's mem_* C ABI.
 const std = @import("std");
+const primitives = @import("primitives.zig");
 
 // ─── Register indices ────────────────────────────────────────────────────────
 pub const EAX: u3 = 0;
@@ -114,8 +119,8 @@ pub const ModRm = struct { mod: u8, reg: u8, rm: u8 };
 
 // ─── Memory access ────────────────────────────────────────────────────────────
 pub inline fn memRead8(s: *CpuState, addr: u32) u8 {
-    if (addr >= @as(u32, @truncate(s.memory_size))) { s.faulted = true; s.halted = true; return 0; }
-    return s.memory[addr];
+    if (!primitives.inBounds1(s.memory_size, addr)) { s.faulted = true; s.halted = true; return 0; }
+    return primitives.readByte(s.memory, addr);
 }
 pub inline fn memRead16(s: *CpuState, addr: u32) u16 {
     return @as(u16, memRead8(s, addr)) | (@as(u16, memRead8(s, addr + 1)) << 8);
@@ -126,22 +131,22 @@ pub inline fn memRead32(s: *CpuState, addr: u32) u32 {
 }
 pub inline fn memReadS32(s: *CpuState, addr: u32) i32 { return @bitCast(memRead32(s, addr)); }
 pub inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
-    if (addr >= @as(u32, @truncate(s.memory_size))) { s.faulted = true; s.halted = true; return; }
+    if (!primitives.inBounds1(s.memory_size, addr)) { s.faulted = true; s.halted = true; return; }
     if (s.watchpoint != 0 and addr == s.watchpoint) {
         s.watchpoint_eip = s.eip;
         s.watchpoint_val = v;
         s.watchpoint_hit = true;
-        s.memory[addr] = v;
+        primitives.writeByte(s.memory, addr, v);
         s.halted = true;
         return;
     }
     if (s.write_hook) |hook| {
-        const old = s.memory[addr];
-        s.memory[addr] = v;
+        const old = primitives.readByte(s.memory, addr);
+        primitives.writeByte(s.memory, addr, v);
         if (old != v) hook(s.history_ctx, s.run_id, s.step_count, addr, old, v);
         return;
     }
-    s.memory[addr] = v;
+    primitives.writeByte(s.memory, addr, v);
 }
 pub inline fn memWrite16(s: *CpuState, addr: u32, v: u16) void {
     memWrite8(s, addr, @truncate(v));
