@@ -7,13 +7,14 @@ const core = @import("core.zig");
 const fpu = @import("fpu.zig");
 const two_byte = @import("two_byte.zig");
 const memory_zig = @import("memory.zig");
-// memory.zig's export fns are never called from cpu.zig itself (they're a
-// standalone C ABI for non-CPU-bound callers) -- so unlike fpu/two_byte,
-// nothing here naturally references them. Without this block, Zig's lazy
-// per-declaration analysis never touches them and the dynamic lib build
-// silently drops them (confirmed via `nm -D`: `zig build test` still finds
-// and runs their `test` blocks either way, since test discovery walks the
-// whole import graph regardless of usage, but that doesn't emit symbols).
+const alloc_zig = @import("alloc.zig");
+// memory.zig/alloc.zig's export fns are never called from cpu.zig itself
+// (they're a standalone C ABI for non-CPU-bound callers) -- so unlike
+// fpu/two_byte, nothing here naturally references them. Without this block,
+// Zig's lazy per-declaration analysis never touches them and the dynamic lib
+// build silently drops them (confirmed via `nm -D`: `zig build test` still
+// finds and runs their `test` blocks either way, since test discovery walks
+// the whole import graph regardless of usage, but that doesn't emit symbols).
 comptime {
     _ = &memory_zig.mem_read8;
     _ = &memory_zig.mem_read_signed8;
@@ -26,6 +27,7 @@ comptime {
     _ = &memory_zig.mem_load;
     _ = &memory_zig.mem_is_valid_address;
     _ = &memory_zig.mem_is_valid_range;
+    _ = &alloc_zig.bump_alloc_next;
 }
 
 // ─── Type and constant aliases from core ────────────────────────────────────
