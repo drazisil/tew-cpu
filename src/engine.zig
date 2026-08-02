@@ -879,7 +879,16 @@ fn opMovR8Imm(comptime r: u8) OpFn { return struct { fn f(s: *CpuState) void {
     else s.regs[r - 4] = (s.regs[r - 4] & 0xFFFF00FF) | (@as(u32, imm) << 8);
 }}.f; }
 fn opMovR32Imm(comptime r: u3) OpFn { return struct { fn f(s: *CpuState) void {
-    s.regs[r] = fetch32(s);
+    // Must honor 0x66: real MOV r16, imm16 reads only 2 bytes and writes only
+    // the low 16 bits (upper 16 untouched) -- ignoring op_size_ovr here reads
+    // 2 bytes too many as a bogus imm32 and desyncs EIP from the real
+    // instruction stream (found live via MSJET35.DLL's 0x15035655 fault).
+    if (s.op_size_ovr) {
+        const imm = fetch16(s);
+        s.regs[r] = (s.regs[r] & 0xFFFF0000) | @as(u32, imm);
+    } else {
+        s.regs[r] = fetch32(s);
+    }
 }}.f; }
 fn opC6(s: *CpuState) void { // MOV rm8, imm8
     const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm); const imm = fetch8(s);
