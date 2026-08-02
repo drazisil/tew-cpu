@@ -328,9 +328,11 @@ fn op04(s: *CpuState) void { // ADD AL, imm8
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al +% imm);
     updateFlagsArithW(s, @as(i64, al) + @as(i64, imm), al, imm, false, .w8);
 }
-fn op05(s: *CpuState) void { // ADD EAX/AX, immv
+fn op05(s: *CpuState) void { // ADD EAX/AX, immv -- see op85's comment: read width
+    // alone isn't enough, flags width must match or SF is wrong for 16-bit results.
     const a = readEaxv(s); const imm = fetchImm(s);
-    writeEaxv(s, a +% imm); updateFlagsArithW(s, @as(i64, a) + @as(i64, imm), a, imm, false, .w32);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    writeEaxv(s, a +% imm); updateFlagsArithW(s, @as(i64, a) + @as(i64, imm), a, imm, false, width);
 }
 fn op10(s: *CpuState) void { // ADC rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
@@ -368,9 +370,10 @@ fn op14(s: *CpuState) void { // ADC AL, imm8
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al +% imm +% c);
     updateFlagsArithW(s, @as(i64, al) + @as(i64, imm) + @as(i64, c), al, imm +% c, false, .w8);
 }
-fn op15(s: *CpuState) void { // ADC EAX/AX, immv
+fn op15(s: *CpuState) void { // ADC EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s); const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
-    writeEaxv(s, a +% imm +% c); updateFlagsArithW(s, @as(i64, a) + @as(i64, imm) + @as(i64, c), a, imm +% c, false, .w32);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    writeEaxv(s, a +% imm +% c); updateFlagsArithW(s, @as(i64, a) + @as(i64, imm) + @as(i64, c), a, imm +% c, false, width);
 }
 fn op18(s: *CpuState) void { // SBB rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
@@ -408,9 +411,10 @@ fn op1C(s: *CpuState) void { // SBB AL, imm8
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al -% imm -% b);
     updateFlagsArithW(s, @as(i64, al) - @as(i64, imm) - @as(i64, b), al, imm +% b, true, .w8);
 }
-fn op1D(s: *CpuState) void { // SBB EAX/AX, immv
+fn op1D(s: *CpuState) void { // SBB EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s); const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0;
-    writeEaxv(s, a -% imm -% b); updateFlagsArithW(s, @as(i64, a) - @as(i64, imm) - @as(i64, b), a, imm +% b, true, .w32);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    writeEaxv(s, a -% imm -% b); updateFlagsArithW(s, @as(i64, a) - @as(i64, imm) - @as(i64, b), a, imm +% b, true, width);
 }
 fn op28(s: *CpuState) void { // SUB rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
@@ -444,9 +448,10 @@ fn op2C(s: *CpuState) void { // SUB AL, imm8
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | (al -% imm);
     updateFlagsArithW(s, @as(i64, al) - @as(i64, imm), al, imm, true, .w8);
 }
-fn op2D(s: *CpuState) void { // SUB EAX/AX, immv
+fn op2D(s: *CpuState) void { // SUB EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s);
-    writeEaxv(s, a -% imm); updateFlagsArithW(s, @as(i64, a) - @as(i64, imm), a, imm, true, .w32);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    writeEaxv(s, a -% imm); updateFlagsArithW(s, @as(i64, a) - @as(i64, imm), a, imm, true, width);
 }
 fn op38(s: *CpuState) void { // CMP rm8, r8
     const d = decodeModRM(s); const op1 = readRm8(s, d.mod, d.rm); const op2 = readReg8(s, d.reg);
@@ -474,9 +479,10 @@ fn op3C(s: *CpuState) void { // CMP AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
     updateFlagsArithW(s, @as(i64, al) - @as(i64, imm), al, imm, true, .w8);
 }
-fn op3D(s: *CpuState) void { // CMP EAX/AX, immv
+fn op3D(s: *CpuState) void { // CMP EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s);
-    updateFlagsArithW(s, @as(i64, a) - @as(i64, imm), a, imm, true, .w32);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    updateFlagsArithW(s, @as(i64, a) - @as(i64, imm), a, imm, true, width);
 }
 fn opIncR32(comptime r: u3) OpFn { return struct { fn f(s: *CpuState) void {
     const op1 = s.regs[r]; s.regs[r] = op1 +% 1;
@@ -545,8 +551,10 @@ fn opA8(s: *CpuState) void { // TEST AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
     updateFlagsLogicW(s, al & imm, .w8);
 }
-fn opA9(s: *CpuState) void { // TEST EAX/AX, immv
-    const a = readEaxv(s); const imm = fetchImm(s); updateFlagsLogicW(s, a & imm, .w32);
+fn opA9(s: *CpuState) void { // TEST EAX/AX, immv -- see op85's comment
+    const a = readEaxv(s); const imm = fetchImm(s);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    updateFlagsLogicW(s, a & imm, width);
 }
 fn opC1(s: *CpuState) void { // Group 2: shift rmv, imm8 -- read was hardcoded
     // 32-bit (readRmFixed32Resolved), ignoring op_size_ovr; see doGroup2's
@@ -753,9 +761,10 @@ fn op0C(s: *CpuState) void { // OR AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
     const r = al | imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogicW(s, r, .w8);
 }
-fn op0D(s: *CpuState) void { // OR EAX/AX, immv
+fn op0D(s: *CpuState) void { // OR EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s); const r = a | imm;
-    updateFlagsLogicW(s, r, .w32); writeEaxv(s, r);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    updateFlagsLogicW(s, r, width); writeEaxv(s, r);
 }
 fn op20(s: *CpuState) void { // AND rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
@@ -783,9 +792,10 @@ fn op24(s: *CpuState) void { // AND AL, imm8
     const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
     const r = al & imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogicW(s, r, .w8);
 }
-fn op25(s: *CpuState) void { // AND EAX/AX, immv
+fn op25(s: *CpuState) void { // AND EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s); const r = a & imm;
-    updateFlagsLogicW(s, r, .w32); writeEaxv(s, r);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    updateFlagsLogicW(s, r, width); writeEaxv(s, r);
 }
 fn op30(s: *CpuState) void { // XOR rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
@@ -809,9 +819,10 @@ fn op33(s: *CpuState) void { // XOR rv, rmv -- see op03's comment
     else s.regs[d.reg] = r;
     updateFlagsLogicW(s, r, width);
 }
-fn op35(s: *CpuState) void { // XOR EAX/AX, immv
+fn op35(s: *CpuState) void { // XOR EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s); const r = a ^ imm;
-    updateFlagsLogicW(s, r, .w32); writeEaxv(s, r);
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    updateFlagsLogicW(s, r, width); writeEaxv(s, r);
 }
 fn op84(s: *CpuState) void { // TEST rm8, r8
     const d = decodeModRM(s);
