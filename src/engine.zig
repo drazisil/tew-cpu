@@ -127,16 +127,16 @@ fn isPrefix(b: u8) bool {
 inline fn strDir(s: *CpuState) i32 { return if (getFlag(s, DF_BIT)) -1 else 1; }
 
 // ─── Group 1 helper (ADD/OR/ADC/SBB/AND/SUB/XOR/CMP) ────────────────────────
-fn doGroup1(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, op1: u32, op2: u32) void {
+fn doGroup1(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, op1: u32, op2: u32, width: Width) void {
     switch (op_ext) {
-        0 => { const r = op1 +% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2), op1, op2, false, .w32); },
-        1 => { const r = op1 | op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, .w32); },
-        2 => { const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 +% op2 +% c; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false, .w32); },
-        3 => { const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 -% op2 -% b; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true, .w32); },
-        4 => { const r = op1 & op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, .w32); },
-        5 => { const r = op1 -% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, .w32); },
-        6 => { const r = op1 ^ op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, .w32); },
-        7 => updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, .w32),
+        0 => { const r = op1 +% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2), op1, op2, false, width); },
+        1 => { const r = op1 | op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, width); },
+        2 => { const c: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 +% op2 +% c; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) + @as(i64, op2) + @as(i64, c), op1, op2 +% c, false, width); },
+        3 => { const b: u32 = if (getFlag(s, CF_BIT)) 1 else 0; const r = op1 -% op2 -% b; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2) - @as(i64, b), op1, op2 +% b, true, width); },
+        4 => { const r = op1 & op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, width); },
+        5 => { const r = op1 -% op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, width); },
+        6 => { const r = op1 ^ op2; writeRmvResolved(s, is_reg, addr, r); updateFlagsLogicW(s, r, width); },
+        7 => updateFlagsArithW(s, @as(i64, op1) - @as(i64, op2), op1, op2, true, width),
         else => { s.faulted = true; s.halted = true; },
     }
 }
@@ -527,11 +527,13 @@ fn op80(s: *CpuState) void { // Group 1 byte: op rm8, imm8
 }
 fn op81(s: *CpuState) void { // Group 1: op rmv, immv
     const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
-    doGroup1(s, res.is_reg, res.addr, d.reg, res.value, fetchImm(s));
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    doGroup1(s, res.is_reg, res.addr, d.reg, res.value, fetchImm(s), width);
 }
 fn op83(s: *CpuState) void { // Group 1: op rmv, imm8 sign-ext
     const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
-    doGroup1(s, res.is_reg, res.addr, d.reg, res.value, @bitCast(@as(i32, fetchS8(s))));
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    doGroup1(s, res.is_reg, res.addr, d.reg, res.value, @bitCast(@as(i32, fetchS8(s))), width);
 }
 fn op86(s: *CpuState) void { // XCHG r8, rm8
     const d = decodeModRM(s); const v1 = readReg8(s, d.reg); const v2 = readRm8(s, d.mod, d.rm);
