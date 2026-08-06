@@ -860,6 +860,29 @@ fn op8B(s: *CpuState) void { // MOV rv, rmv
 fn op8D(s: *CpuState) void { // LEA r32, rm
     const d = decodeModRM(s); const r = resolveRm(s, d.mod, d.rm); s.regs[d.reg] = r.addr;
 }
+fn op8C(s: *CpuState) void { // MOV rm16, Sreg -- ported from pe-walker
+    const d = decodeModRM(s);
+    const sel: u16 = switch (d.reg) {
+        0 => s.seg_es, 1 => s.seg_cs, 2 => s.seg_ss,
+        3 => s.seg_ds, 4 => s.seg_fs, 5 => s.seg_gs,
+        else => { s.faulted = true; s.halted = true; return; }, // reserved encoding, real #UD
+    };
+    const r = resolveRm(s, d.mod, d.rm);
+    if (r.is_reg) {
+        s.regs[r.addr] = sel; // zero-extends upper 16 bits (real modern-x86 behavior)
+    } else {
+        memWrite16(s, applySegOvr(s, r.addr), sel);
+    }
+}
+fn op8F(s: *CpuState) void { // POP rm32 (register form already covered by
+    // 0x58-0x5F; this is the less-common memory-operand form) -- ported
+    // from pe-walker, confirmed live there against real Windows XP
+    // kernel32.dll: `pop dword ptr fs:[0]`, the standard SEH epilogue
+    // restoring NT_TIB.ExceptionList.
+    const d = decodeModRM(s);
+    const val = pop32(s);
+    writeRmFixed32(s, d.mod, d.rm, val);
+}
 fn opA0(s: *CpuState) void { // MOV AL, [disp32]
     const addr = applySegOvr(s, fetch32(s));
     s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | memRead8(s, addr);
@@ -1273,7 +1296,7 @@ const dispatch_table: [256]OpFn = dt: {
     t[0x60] = op60; t[0x61] = op61; t[0x68] = op68; t[0x69] = op69; t[0x6A] = op6A; t[0x6B] = op6B;
     t[0x80] = op80; t[0x81] = op81; t[0x83] = op83; t[0x84] = op84; t[0x85] = op85;
     t[0x86] = op86; t[0x87] = op87;
-    t[0x88] = op88; t[0x89] = op89; t[0x8A] = op8A; t[0x8B] = op8B; t[0x8D] = op8D;
+    t[0x88] = op88; t[0x89] = op89; t[0x8A] = op8A; t[0x8B] = op8B; t[0x8C] = op8C; t[0x8D] = op8D; t[0x8F] = op8F;
     t[0x90] = opNop;
     var rx: u8 = 1;
     while (rx < 8) : (rx += 1) {
@@ -1742,5 +1765,87 @@ test "doGroup2 SAR AX,1 sign-extends within 16 bits, not 32" {
     s.regs[EAX] = 0x00008000;
     cpuStep(&s);
     try testing.expectEqual(@as(u32, 0x0000C000), s.regs[EAX] & 0xFFFF);
+}
+
+// ─── Ported-from-pe-walker instruction coverage (2026-08-06) ─────────────────
+// First-ever tests for these five: pe-walker's own PROVENANCE.md documents
+// live confirmation against real Windows XP DLLs, but never carried Zig-level
+// unit tests of its own.
+
+test "CMPXCHG rm32,r32 (0x0F 0xB1): match sets ZF and stores src into rm" {
+    var mem = [_]u8{0x0F, 0xB1, 0xD1} ++ [_]u8{0} ** 61; // cmpxchg ecx, edx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 100; s.regs[ECX] = 100; s.regs[EDX] = 200;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 200), s.regs[ECX]);
+    try testing.expectEqual(@as(u32, 100), s.regs[EAX]); // unchanged on match
+    try testing.expect(getFlag(&s, ZF_BIT));
+}
+
+test "CMPXCHG rm32,r32 (0x0F 0xB1): mismatch clears ZF and loads rm into EAX" {
+    var mem = [_]u8{0x0F, 0xB1, 0xD1} ++ [_]u8{0} ** 61; // cmpxchg ecx, edx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 100; s.regs[ECX] = 999; s.regs[EDX] = 200;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 999), s.regs[EAX]); // EAX <- rm on mismatch
+    try testing.expectEqual(@as(u32, 999), s.regs[ECX]); // rm untouched
+    try testing.expect(!getFlag(&s, ZF_BIT));
+}
+
+test "SHRD rm32,r32,imm8 (0x0F 0xAC): bits shift in from src's low bits" {
+    var mem = [_]u8{0x0F, 0xAC, 0xD1, 0x04} ++ [_]u8{0} ** 60; // shrd ecx, edx, 4
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ECX] = 0x00000001; s.regs[EDX] = 0xFFFFFFFF;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0xF0000000), s.regs[ECX]);
+}
+
+test "SHLD rm32,r32,imm8 (0x0F 0xA4): bits shift in from src's high bits" {
+    var mem = [_]u8{0x0F, 0xA4, 0xD1, 0x04} ++ [_]u8{0} ** 60; // shld ecx, edx, 4
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ECX] = 0x00000001; s.regs[EDX] = 0xFFFFFFFF;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x0000001F), s.regs[ECX]);
+}
+
+test "SHRD/SHLD count=0 is a real no-op: unchanged value, no flags touched" {
+    var mem = [_]u8{0x0F, 0xAC, 0xD1, 0x00} ++ [_]u8{0} ** 60; // shrd ecx, edx, 0
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ECX] = 0x12345678; s.regs[EDX] = 0xFFFFFFFF;
+    s.eflags = 0x202; // known baseline
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12345678), s.regs[ECX]);
+    try testing.expectEqual(@as(u32, 0x202), s.eflags);
+}
+
+test "MOV rm16,Sreg (0x8C): reads the real selector, zero-extends into a r32 dest" {
+    var mem = [_]u8{0x8C, 0xE1} ++ [_]u8{0} ** 62; // mov cx, fs
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ECX] = 0xFFFFFFFF; // sentinel to prove upper 16 bits get zeroed
+    s.seg_fs = 0x003B;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x0000003B), s.regs[ECX]);
+}
+
+test "MOV rm16,Sreg (0x8C): reserved reg encoding 6/7 faults instead of reading garbage" {
+    var mem = [_]u8{0x8C, 0xF1} ++ [_]u8{0} ** 62; // mod=11 reg=110(6) rm=001 -- reserved
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    cpuStep(&s);
+    try testing.expect(s.faulted);
+    try testing.expect(s.halted);
+}
+
+test "POP rm32 memory operand (0x8F): real Windows SEH epilogue shape, `pop dword ptr [reg]`" {
+    var mem = [_]u8{0x8F, 0x01} ++ [_]u8{0} ** 1022; // pop dword ptr [ecx]
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ECX] = 0x300; // destination write address, well clear of code/stack
+    s.regs[ESP] = 0x200;
+    mem[0x200] = 0xBE; mem[0x201] = 0xBA; mem[0x202] = 0xFE; mem[0x203] = 0xCA; // 0xCAFEBABE, little-endian
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x204), s.regs[ESP]); // real POP still advances ESP
+    try testing.expectEqual(@as(u8, 0xBE), mem[0x300]);
+    try testing.expectEqual(@as(u8, 0xBA), mem[0x301]);
+    try testing.expectEqual(@as(u8, 0xFE), mem[0x302]);
+    try testing.expectEqual(@as(u8, 0xCA), mem[0x303]);
 }
 

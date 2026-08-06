@@ -33,13 +33,19 @@ pub const CpuState = core.CpuState;
 pub const RunResult = core.RunResult;
 pub const WriteHookFn = core.WriteHookFn;
 pub const StepHookFn = core.StepHookFn;
+// IntHandlerFn: ported from pe-walker (PROVENANCE.md's "IntHandlerFn alias
+// visibility fix") -- this alias already existed and worked internally, but
+// wasn't `pub`, so an external Zig consumer importing this file as a module
+// couldn't reference the type to install its own interrupt handler (every
+// software interrupt unconditionally faulted there as a result). Same
+// reasoning as CpuState/RunResult/WriteHookFn/StepHookFn above.
+pub const IntHandlerFn = core.IntHandlerFn;
 const EAX = core.EAX; const ECX = core.ECX; const EDX = core.EDX; const EBX = core.EBX;
 const ESP = core.ESP; const EBP = core.EBP; const ESI = core.ESI; const EDI = core.EDI;
 const CF_BIT = core.CF_BIT; const PF_BIT = core.PF_BIT; const ZF_BIT = core.ZF_BIT;
 const SF_BIT = core.SF_BIT; const DF_BIT = core.DF_BIT; const OF_BIT = core.OF_BIT;
 const SEG_NONE = core.SEG_NONE; const SEG_FS = core.SEG_FS; const SEG_GS = core.SEG_GS;
 const REP_NONE = core.REP_NONE; const REP_REP = core.REP_REP; const REP_REPNE = core.REP_REPNE;
-const IntHandlerFn = core.IntHandlerFn;
 const OpFn = core.OpFn;
 const RmInfo = core.RmInfo;
 const Rm8Result = core.Rm8Result;

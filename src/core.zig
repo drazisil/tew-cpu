@@ -82,6 +82,18 @@ pub const CpuState = struct {
     fatal_halted: bool = false,
     fs_base: u32 = 0,
     gs_base: u32 = 0,
+    // 16-bit segment *selector* values -- ported from pe-walker, distinct
+    // from fs_base/gs_base above (those are only the linear base address
+    // applySegOvr resolves fs:/gs:-prefixed operands against, not the
+    // selector itself). Confirmed live there against real Windows XP
+    // kernel32.dll: `mov word ptr [eax+0xbc], cs` (and the ds/es/fs/gs/ss
+    // siblings), real ntdll!RtlCaptureContext populating a CONTEXT struct.
+    seg_cs: u16 = 0,
+    seg_ds: u16 = 0,
+    seg_es: u16 = 0,
+    seg_fs: u16 = 0,
+    seg_gs: u16 = 0,
+    seg_ss: u16 = 0,
     step_count: u64 = 0,
     last_opcode: u8 = 0,
     int_handler: ?IntHandlerFn = null,

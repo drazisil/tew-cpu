@@ -52,6 +52,44 @@ pub fn op0F(s: *CpuState) void {
             const rel = core.fetchS32(s);
             if (core.evalCond(s, op2 & 0xF)) s.eip = s.eip +% @as(u32, @bitCast(rel));
         },
+        0xB1 => { // CMPXCHG rm32, r32 -- ported from pe-walker (confirmed live
+            // against real Windows XP kernel32.dll: `lock cmpxchg dword ptr
+            // [edx], ecx`, a classic InterlockedCompareExchange shape; the
+            // `lock` prefix needs no special handling, already tolerated as
+            // an ordinary skippable prefix byte for this single-threaded
+            // interpreter). Adapted to tew's current width-aware flags API
+            // (updateFlagsArithW + explicit .w32, not pe-walker's
+            // pre-width-split updateFlagsArith).
+            const d = core.decodeModRM(s);
+            const res = core.readRmFixed32Resolved(s, d.mod, d.rm);
+            const acc = s.regs[EAX];
+            core.updateFlagsArithW(s, @as(i64, acc) - @as(i64, res.value), acc, res.value, true, .w32);
+            if (acc == res.value) {
+                core.writeRmFixed32Resolved(s, res.is_reg, res.addr, s.regs[d.reg]);
+            } else {
+                s.regs[EAX] = res.value;
+            }
+        },
+        0xAC => { // SHRD rm32, r32, imm8 -- ported from pe-walker, see doShrd
+            const d = core.decodeModRM(s); const res = core.readRmFixed32Resolved(s, d.mod, d.rm);
+            const count = core.fetch8(s) & 0x1F;
+            doShrd(s, res.is_reg, res.addr, res.value, s.regs[d.reg], count);
+        },
+        0xAD => { // SHRD rm32, r32, CL -- ported from pe-walker, see doShrd
+            const d = core.decodeModRM(s); const res = core.readRmFixed32Resolved(s, d.mod, d.rm);
+            const count: u8 = @truncate(s.regs[ECX] & 0x1F);
+            doShrd(s, res.is_reg, res.addr, res.value, s.regs[d.reg], count);
+        },
+        0xA4 => { // SHLD rm32, r32, imm8 -- ported from pe-walker, see doShld
+            const d = core.decodeModRM(s); const res = core.readRmFixed32Resolved(s, d.mod, d.rm);
+            const count = core.fetch8(s) & 0x1F;
+            doShld(s, res.is_reg, res.addr, res.value, s.regs[d.reg], count);
+        },
+        0xA5 => { // SHLD rm32, r32, CL -- ported from pe-walker, see doShld
+            const d = core.decodeModRM(s); const res = core.readRmFixed32Resolved(s, d.mod, d.rm);
+            const count: u8 = @truncate(s.regs[ECX] & 0x1F);
+            doShld(s, res.is_reg, res.addr, res.value, s.regs[d.reg], count);
+        },
         0xC1 => { // XADD rmv, rv -- was hardcoded 32-bit throughout, ignoring
             // 0x66 (op_size_ovr); now width-aware on both the rm operand and
             // the register operand, matching op8B's MOV rv,rmv pattern.
@@ -121,4 +159,40 @@ pub fn op0F(s: *CpuState) void {
         0x77 => mmx.opEmms(s),        // EMMS
         else => { s.faulted = true; s.halted = true; },
     }
+}
+
+// ─── SHRD/SHLD (double-precision shift) ───────────────────────────────────────
+// Ported from pe-walker (see PROVENANCE.md there): real x86 semantics, dest
+// is shifted by count with bits shifted in from src on the far side rather
+// than zero-filled -- the classic pattern for extracting a shifted field out
+// of a 64-bit value held across two 32-bit registers. Confirmed live there
+// against real ntdll.dll heap-manager code (`shrd eax, edx, 0x18`). count is
+// already masked to 5 bits by both callers (0xAC/0xAD and 0xA4/0xA5 above),
+// matching real hardware's behavior for a 32-bit destination.
+//
+// count == 0 is a real, legal no-op (write the unchanged value back, touch
+// no flags) -- required before computing `32 - count` below, which would
+// otherwise be an invalid (>31) shift amount for a u5.
+//
+// Flags: CF is the last bit shifted out (same formula SHR/SHL use in
+// doGroup2). OF is only defined for a 1-bit shift (a real sign change),
+// matching ROL/ROR's existing convention.
+fn doShrd(s: *CpuState, is_reg: bool, addr: u32, dest: u32, src: u32, count: u8) void {
+    if (count == 0) { core.writeRmFixed32Resolved(s, is_reg, addr, dest); return; }
+    const c: u5 = @truncate(count);
+    const result = (dest >> c) | (src << @as(u5, @truncate(32 - @as(u8, c))));
+    core.writeRmFixed32Resolved(s, is_reg, addr, result);
+    core.updateFlagsLogicW(s, result, .w32);
+    core.setFlag(s, CF_BIT, ((dest >> @as(u5, @truncate(count - 1))) & 1) != 0);
+    if (count == 1) core.setFlag(s, OF_BIT, ((result & 0x80000000) != 0) != ((dest & 0x80000000) != 0));
+}
+
+fn doShld(s: *CpuState, is_reg: bool, addr: u32, dest: u32, src: u32, count: u8) void {
+    if (count == 0) { core.writeRmFixed32Resolved(s, is_reg, addr, dest); return; }
+    const c: u5 = @truncate(count);
+    const result = (dest << c) | (src >> @as(u5, @truncate(32 - @as(u8, c))));
+    core.writeRmFixed32Resolved(s, is_reg, addr, result);
+    core.updateFlagsLogicW(s, result, .w32);
+    core.setFlag(s, CF_BIT, ((dest >> @as(u5, @truncate(32 - @as(u8, count)))) & 1) != 0);
+    if (count == 1) core.setFlag(s, OF_BIT, ((result & 0x80000000) != 0) != ((dest & 0x80000000) != 0));
 }
