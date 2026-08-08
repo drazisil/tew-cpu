@@ -47,6 +47,7 @@ const setFlag = core.setFlag;
 const Width = core.Width;
 const updateFlagsArithW = core.updateFlagsArithW;
 const updateFlagsLogicW = core.updateFlagsLogicW;
+const updateFlagsShiftW = core.updateFlagsShiftW;
 const readReg8 = core.readReg8;
 const writeReg8 = core.writeReg8;
 const push32 = core.push32;
@@ -192,14 +193,14 @@ fn doGroup2(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u32, count: 
             const shift_for_cf: u6 = if (count > bits) bits else @as(u6, @intCast(count));
             const new_cf = shift_for_cf != 0 and ((val >> @as(u5, @truncate(bits - shift_for_cf))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, width);
+            setFlag(s, CF_BIT, new_cf); updateFlagsShiftW(s, r, width);
         },
         5 => { // SHR -- see SHL's comment
             const r = (val & mask) >> c5;
             const shift_for_cf: u6 = if (count > bits) bits else @as(u6, @intCast(count));
             const new_cf = shift_for_cf != 0 and ((val >> @as(u5, @truncate(shift_for_cf - 1))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, width);
+            setFlag(s, CF_BIT, new_cf); updateFlagsShiftW(s, r, width);
         },
         7 => { // SAR -- was hardcoded-32-bit write (writeRmFixed32Resolved,
             // same memory-corruption shape as count==0 above) AND assumed a
@@ -219,7 +220,7 @@ fn doGroup2(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u32, count: 
             const shift_for_cf: u6 = if (count > bits) bits else @as(u6, @intCast(count));
             const new_cf = shift_for_cf != 0 and ((val >> @as(u5, @truncate(shift_for_cf - 1))) & 1) != 0;
             writeRmvResolved(s, is_reg, addr, shifted);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, shifted, width);
+            setFlag(s, CF_BIT, new_cf); updateFlagsShiftW(s, shifted, width);
         },
         else => { s.faulted = true; s.halted = true; },
     }
@@ -269,21 +270,21 @@ fn doGroup2_8(s: *CpuState, is_reg: bool, addr: u32, op_ext: u8, val: u8, count:
             const r: u8 = if (c8 == 0) val else val << c8;
             const new_cf = if (count <= 8) ((val >> @as(u3, @truncate(8 - @as(u8, count)))) & 1) != 0 else false;
             writeRm8Resolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, .w8);
+            setFlag(s, CF_BIT, new_cf); updateFlagsShiftW(s, r, .w8);
         },
         5 => { // SHR r/m8
             const c8: u3 = @truncate(count & 7);
             const r: u8 = if (c8 == 0) val else val >> c8;
             const new_cf = ((val >> @as(u3, @truncate(count - 1))) & 1) != 0;
             writeRm8Resolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, .w8);
+            setFlag(s, CF_BIT, new_cf); updateFlagsShiftW(s, r, .w8);
         },
         7 => { // SAR r/m8
             const c8: u3 = @truncate(count & 7);
             const r: u8 = @bitCast(@as(i8, @bitCast(val)) >> c8);
             const new_cf = ((val >> @as(u3, @truncate(count - 1))) & 1) != 0;
             writeRm8Resolved(s, is_reg, addr, r);
-            setFlag(s, CF_BIT, new_cf); updateFlagsLogicW(s, r, .w8);
+            setFlag(s, CF_BIT, new_cf); updateFlagsShiftW(s, r, .w8);
         },
         else => { s.faulted = true; s.halted = true; },
     }
@@ -1532,6 +1533,38 @@ test "SBB AL,imm8 sets SF when the borrow-in pushes the result below 0" {
     try testing.expect(getFlag(&s, SF_BIT));
 }
 
+test "SBB AL,imm8 sets CF correctly when operand+borrow wraps its own width (regression: op2 +% b silently wrapped to 0, hiding a real borrow)" {
+    // sbb al,0xff with AL=0, CF(borrow-in)=1: real x86 computes
+    // 0 - 0xff - 1 = -256 in full precision, which definitely borrows
+    // (CF must be set) and truncates to AL=0x00. The buggy code computed
+    // op2 +% b = 0xff +% 1 = 0x00 (u8 wraparound), then compared
+    // AL(0) < 0(wrapped op2) -- always false -- so CF came out clear
+    // instead of set.
+    var mem = [_]u8{0x1C, 0xFF} ++ [_]u8{0} ** 62; // sbb al,0xff
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000000;
+    setFlag(&s, CF_BIT, true);
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000000), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "ADC AL,imm8 sets CF correctly when operand+carry wraps its own width (regression: op2 +% c silently wrapped to 0, hiding a real carry-out)" {
+    // adc al,0xff with AL=5, CF(carry-in)=1: real x86 computes
+    // 5 + 0xff + 1 = 261 in full precision, which exceeds 255 (CF must
+    // be set) and truncates to AL=0x05. The buggy code computed
+    // op2 +% c = 0xff +% 1 = 0x00 (u8 wraparound), then checked
+    // r(5) < AL(5) or r(5) < 0(wrapped op2) -- both false -- so CF came
+    // out clear instead of set.
+    var mem = [_]u8{0x14, 0xFF} ++ [_]u8{0} ** 62; // adc al,0xff
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000005;
+    setFlag(&s, CF_BIT, true);
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000005), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, CF_BIT));
+}
+
 test "INC rm8 sets SF and OF on 0x7f -> 0x80, leaves CF untouched" {
     var mem = [_]u8{0xFE, 0xC0} ++ [_]u8{0} ** 62; // inc al
     var s = CpuState{ .memory = &mem, .memory_size = mem.len };
@@ -1765,6 +1798,40 @@ test "doGroup2 SAR AX,1 sign-extends within 16 bits, not 32" {
     s.regs[EAX] = 0x00008000;
     cpuStep(&s);
     try testing.expectEqual(@as(u32, 0x0000C000), s.regs[EAX] & 0xFFFF);
+}
+
+test "doGroup2 SHR EAX,1 sets CF to the shifted-out bit (regression: updateFlagsLogicW clobbered a correctly-computed CF back to false)" {
+    // shr eax,1 with EAX=1: bit 0 (the only set bit) shifts out, so CF
+    // must be set and the result is 0. All three shift cases (SHL/SHR/
+    // SAR) computed the right CF via setFlag() and then immediately threw
+    // it away by calling updateFlagsLogicW() afterward, which -- correct
+    // for AND/OR/XOR/TEST, wrong for shifts -- unconditionally clears CF.
+    var mem = [_]u8{0xD1, 0xE8} ++ [_]u8{0} ** 62; // shr eax,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000001;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000000), s.regs[EAX]);
+    try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "doGroup2 SHL EAX,1 sets CF to the shifted-out bit" {
+    // shl eax,1 with EAX's top bit set: that bit shifts out into CF.
+    var mem = [_]u8{0xD1, 0xE0} ++ [_]u8{0} ** 62; // shl eax,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x80000000;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000000), s.regs[EAX]);
+    try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "doGroup2 SAR EAX,1 sets CF to the shifted-out bit" {
+    // sar eax,1 with EAX=3 (0b11): bit 0 shifts out into CF.
+    var mem = [_]u8{0xD1, 0xF8} ++ [_]u8{0} ** 62; // sar eax,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000003;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000001), s.regs[EAX]);
+    try testing.expect(getFlag(&s, CF_BIT));
 }
 
 // ─── Ported-from-pe-walker instruction coverage (2026-08-06) ─────────────────

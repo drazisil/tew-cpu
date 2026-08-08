@@ -240,10 +240,27 @@ pub fn updateFlagsArithW(s: *CpuState, result_raw: i64, op1: anytype, op2: anyty
     var p: u8 = @truncate(r);
     p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
+    // CF must come from result_raw (the full-precision, un-truncated delta
+    // every caller already computes correctly), not from re-deriving it via
+    // o1/o2 -- those are masked *after* the caller has potentially already
+    // folded an incoming carry/borrow into op2 using width-native wrapping
+    // arithmetic (e.g. ADC/SBB's `op2 +% c`/`op2 +% b`). When the real
+    // operand is already at its width's max value and there's an incoming
+    // carry/borrow, that wrapping add silently rolls over to 0 before ever
+    // reaching this function, which used to make CF compute as always-false
+    // in that exact edge case. Found 2026-08-08 while investigating a real
+    // MSJET35.DLL B-tree stall (a signed/unsigned-adjacent value going
+    // negative and wrapping to ~4.3 billion in a decrement loop) -- this
+    // bug is real and independently confirmed via a failing/passing test,
+    // but a live re-run after this fix alone showed the stall is NOT
+    // caused by it; the actual source of the bad value is still unknown.
+    // result_raw has no such wraparound -- it's computed in i64, with
+    // plenty of headroom for any 8/16/32-bit operand plus a +/-1
+    // carry/borrow term.
     if (is_sub) {
-        setFlag(s, CF_BIT, o1 < o2);
+        setFlag(s, CF_BIT, result_raw < 0);
     } else {
-        setFlag(s, CF_BIT, r < o1 or r < o2);
+        setFlag(s, CF_BIT, result_raw > @as(i64, mask));
     }
     const s1 = (o1 & sign_bit) != 0;
     const s2 = (o2 & sign_bit) != 0;
@@ -253,6 +270,27 @@ pub fn updateFlagsArithW(s: *CpuState, result_raw: i64, op1: anytype, op2: anyty
     } else {
         setFlag(s, OF_BIT, s1 == s2 and sr != s1);
     }
+}
+
+pub fn updateFlagsShiftW(s: *CpuState, result: anytype, width: Width) void {
+    // ZF/SF/PF, same as updateFlagsLogicW -- but deliberately does NOT
+    // touch CF: SHL/SHR/SAR compute CF themselves (the bit shifted out)
+    // and must call this AFTER setFlag(CF_BIT, ...), not have it clobbered
+    // back to false the way updateFlagsLogicW always does (correct for
+    // AND/OR/XOR/TEST, wrong for shifts -- confirmed live 2026-08-08:
+    // every SHL/SHR/SAR in this codebase was reusing updateFlagsLogicW and
+    // silently reporting CF=false after every single shift, regardless of
+    // what bit actually shifted out). OF is left at its prior value too --
+    // real x86 only defines OF for single-bit shifts, and this project has
+    // no shift-specific OF computation yet; leaving it untouched rather
+    // than unconditionally clearing it is closer to real hardware's
+    // "undefined for count>1" than a blanket false.
+    const r: u32 = @as(u32, result) & widthMask(width);
+    setFlag(s, ZF_BIT, r == 0);
+    setFlag(s, SF_BIT, (r & widthSignBit(width)) != 0);
+    var p: u8 = @truncate(r);
+    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+    setFlag(s, PF_BIT, (p & 1) == 0);
 }
 
 pub fn updateFlagsLogicW(s: *CpuState, result: anytype, width: Width) void {
