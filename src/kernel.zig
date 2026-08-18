@@ -22,6 +22,7 @@ const std = @import("std");
 const core = @import("core.zig");
 const engine = @import("engine.zig");
 const primitives = @import("primitives.zig");
+const scheduler = @import("scheduler.zig");
 
 // ─── Type and constant aliases from core ────────────────────────────────────
 // CpuState/RunResult are `pub` -- unlike the rest of these aliases -- so an
@@ -210,6 +211,134 @@ export fn cpu_remove_logpoint(s: *CpuState, eip: u32) void {
 }
 export fn cpu_clear_logpoints(s: *CpuState) void {
     s.lp_eip = .{0} ** 8; s.lp_cb = .{null} ** 8;
+}
+
+// ─── Scheduler C ABI (see scheduler.zig) ────────────────────────────────────
+// Stage 1 of the scheduler-to-Zig port (~/.claude/plans/vast-drifting-pike.md):
+// context switch + reentrancy guard only. Blocking/wake/tick (Stage 2) and
+// the TLS bitset alloc/free/allocated exports + direct-field accessors
+// (Stage 3) land in later stages.
+pub const SchedulerState = scheduler.SchedulerState;
+
+export fn scheduler_create() ?*SchedulerState {
+    const s = std.heap.c_allocator.create(SchedulerState) catch return null;
+    s.* = SchedulerState{};
+    return s;
+}
+export fn scheduler_destroy(s: *SchedulerState) void {
+    std.heap.c_allocator.destroy(s);
+}
+export fn scheduler_create_main_thread(s: *SchedulerState, thread_id: u32, handle: u32) void {
+    scheduler.createMainThread(s, thread_id, handle);
+}
+export fn scheduler_create_thread(s: *SchedulerState, thread_id: u32, handle: u32, start_address: u32, parameter: u32, suspended: bool) u32 {
+    return scheduler.createThread(s, thread_id, handle, start_address, parameter, suspended);
+}
+export fn scheduler_switch_to(s: *SchedulerState, cpu: *CpuState, idx: u32) bool {
+    return scheduler.switchTo(s, cpu, idx);
+}
+export fn scheduler_preempt_slice(s: *SchedulerState, cpu: *CpuState) bool {
+    return scheduler.preemptSlice(s, cpu);
+}
+export fn scheduler_pick_next_ready(s: *SchedulerState, cpu: *CpuState) i32 {
+    if (scheduler.pickNextReady(s, cpu)) |idx| return @intCast(idx);
+    return -1;
+}
+export fn scheduler_enter_reentrant_call(s: *SchedulerState) void {
+    scheduler.enterReentrantCall(s);
+}
+export fn scheduler_exit_reentrant_call(s: *SchedulerState) void {
+    scheduler.exitReentrantCall(s);
+}
+export fn scheduler_reentrant_depth(s: *SchedulerState) u32 {
+    return s.reentrant_depth;
+}
+export fn scheduler_current_idx(s: *SchedulerState) i32 {
+    return s.current_idx;
+}
+// thread_count / virtual_ticks_ms get+set: gap-filled during Stage 4 Python
+// wiring -- CRTState.virtual_ticks_ms (_state.py) is a read/write property
+// forwarding straight to the scheduler, and kernel32_io.py's CreateThread
+// handler logs `len(state.scheduler.threads)` for its assigned-idx message.
+// Trivial field access, same inline-in-kernel.zig style as
+// scheduler_current_idx/scheduler_reentrant_depth above -- no scheduler.zig
+// indirection needed for a plain field read/write.
+export fn scheduler_thread_count(s: *SchedulerState) u32 {
+    return s.thread_count;
+}
+export fn scheduler_get_virtual_ticks_ms(s: *SchedulerState) u32 {
+    return s.virtual_ticks_ms;
+}
+export fn scheduler_set_virtual_ticks_ms(s: *SchedulerState, val: u32) void {
+    s.virtual_ticks_ms = val;
+}
+
+// ─── Scheduler C ABI, Stage 2: blocking/wake/tick ───────────────────────────
+// See scheduler.zig's "Public: blocking operations" section header for the
+// two-call kernel-tick protocol these `complete_*` wrappers are one half of
+// -- callers MUST resolve `next_idx` via scheduler_pick_next_ready (with a
+// Kernel.tick() retry on -1) themselves; these do not scan.
+export fn scheduler_complete_block_on_cs(s: *SchedulerState, cpu: *CpuState, cs_ptr: u32, retry_eip: u32, next_idx: i32) bool {
+    return scheduler.completeBlockOnCs(s, cpu, cs_ptr, retry_eip, next_idx);
+}
+export fn scheduler_complete_block_on_handles(s: *SchedulerState, cpu: *CpuState, handles: [*]const u32, handles_count: u32, retry_eip: u32, has_deadline: bool, deadline_ms: u32, next_idx: i32) bool {
+    return scheduler.completeBlockOnHandles(s, cpu, handles[0..handles_count], retry_eip, has_deadline, deadline_ms, next_idx);
+}
+export fn scheduler_complete_sleep_current(s: *SchedulerState, cpu: *CpuState, return_eip: u32, eax_val: u32, sleep_ms: u32, next_idx: i32) bool {
+    return scheduler.completeSleepCurrent(s, cpu, return_eip, eax_val, sleep_ms, next_idx);
+}
+export fn scheduler_complete_mark_current_dead(s: *SchedulerState, cpu: *CpuState, next_idx: i32) bool {
+    return scheduler.completeMarkCurrentDead(s, cpu, next_idx);
+}
+export fn scheduler_terminate_thread(s: *SchedulerState, cpu: *CpuState, handle: u32, next_idx: i32) i8 {
+    return scheduler.terminateThread(s, cpu, handle, next_idx);
+}
+export fn scheduler_unblock_cs(s: *SchedulerState, cs_ptr: u32) void {
+    scheduler.unblockCs(s, cs_ptr);
+}
+export fn scheduler_unblock_handle(s: *SchedulerState, handle: u32) u32 {
+    return scheduler.unblockHandle(s, handle);
+}
+export fn scheduler_tick(s: *SchedulerState, ms: u32) void {
+    scheduler.tick(s, ms);
+}
+
+// ─── Scheduler C ABI, Stage 3: TLS bitset + handle-keyed accessors ─────────
+export fn scheduler_tls_alloc_slot(s: *SchedulerState, slot: u8) void {
+    scheduler.tlsAllocSlot(s, @truncate(slot));
+}
+export fn scheduler_tls_free_slot(s: *SchedulerState, slot: u8) void {
+    scheduler.tlsFreeSlot(s, @truncate(slot));
+}
+export fn scheduler_tls_slot_allocated(s: *SchedulerState, slot: u8) bool {
+    return scheduler.tlsSlotAllocated(s, @truncate(slot));
+}
+export fn scheduler_get_suspended(s: *SchedulerState, handle: u32) bool {
+    return scheduler.getSuspended(s, handle);
+}
+export fn scheduler_set_suspended(s: *SchedulerState, handle: u32, val: bool) void {
+    scheduler.setSuspended(s, handle, val);
+}
+export fn scheduler_get_completed(s: *SchedulerState, handle: u32) bool {
+    return scheduler.getCompleted(s, handle);
+}
+export fn scheduler_get_wait_timed_out(s: *SchedulerState, handle: u32) bool {
+    return scheduler.getWaitTimedOut(s, handle);
+}
+export fn scheduler_set_wait_timed_out(s: *SchedulerState, handle: u32, val: bool) void {
+    scheduler.setWaitTimedOut(s, handle, val);
+}
+export fn scheduler_get_status(s: *SchedulerState, handle: u32) u8 {
+    return scheduler.getStatus(s, handle);
+}
+export fn scheduler_get_thread_id(s: *SchedulerState, handle: u32) i64 {
+    return scheduler.getThreadId(s, handle);
+}
+export fn scheduler_handle_at_idx(s: *SchedulerState, idx: u32) i64 {
+    return scheduler.handleAtIdx(s, idx);
+}
+export fn scheduler_current_handle(s: *SchedulerState) u32 {
+    return scheduler.currentHandle(s);
 }
 
 // ─── Execution-history capture (see history/capture.zig) ───────────────────
@@ -484,4 +613,141 @@ test "public C ABI: out-of-bounds fetch faults, not crashes" {
     const result = cpu_run(s, 10);
     try testing.expectEqual(RunResult.faulted, result);
     try testing.expect(cpu_is_faulted(s));
+}
+
+test "public C ABI: scheduler create -> thread creation -> preempt_slice -> destroy" {
+    // Heap-allocated (not a stack array like the other tests above): needs to
+    // cover TEB (0x00320000+) plus a small test stack, too large to be safe
+    // on the test runner's stack.
+    const mem = try testing.allocator.alloc(u8, 0x00340000);
+    defer testing.allocator.free(mem);
+    @memset(mem, 0);
+    const cpu = cpu_create(mem.ptr, mem.len).?;
+    defer cpu_destroy(cpu);
+
+    const sched = scheduler_create().?;
+    defer scheduler_destroy(sched);
+    sched.thread_stack_next = 0x1000;
+
+    scheduler_create_main_thread(sched, 1000, 0xBEEF);
+    _ = scheduler_create_thread(sched, 1001, 0xBEF0, 0x9F0000, 0x0, false);
+
+    try testing.expectEqual(@as(i32, 0), scheduler_current_idx(sched));
+    const switched = scheduler_preempt_slice(sched, cpu);
+    try testing.expect(switched);
+    try testing.expectEqual(@as(i32, 1), scheduler_current_idx(sched));
+    try testing.expectEqual(@as(u32, 0x9F0000), cpu_get_eip(cpu));
+
+    try testing.expectEqual(@as(u32, 0), scheduler_reentrant_depth(sched));
+    scheduler_enter_reentrant_call(sched);
+    try testing.expectEqual(@as(u32, 1), scheduler_reentrant_depth(sched));
+    const refused = scheduler_switch_to(sched, cpu, 0);
+    try testing.expect(!refused);
+    scheduler_exit_reentrant_call(sched);
+    try testing.expectEqual(@as(u32, 0), scheduler_reentrant_depth(sched));
+}
+
+test "public C ABI: scheduler block_on_handles -> pick_next_ready -> unblock -> tick" {
+    const mem = try testing.allocator.alloc(u8, 0x00340000);
+    defer testing.allocator.free(mem);
+    @memset(mem, 0);
+    const cpu = cpu_create(mem.ptr, mem.len).?;
+    defer cpu_destroy(cpu);
+
+    const sched = scheduler_create().?;
+    defer scheduler_destroy(sched);
+    sched.thread_stack_next = 0x1000;
+    scheduler_create_main_thread(sched, 1000, 0xBEEF);
+    _ = scheduler_create_thread(sched, 1001, 0xBEF0, 0x9F0000, 0x0, false);
+
+    // Block the main thread on a handle; the two-call protocol: resolve
+    // next_idx via pick_next_ready first, then complete the block.
+    const next_idx = scheduler_pick_next_ready(sched, cpu);
+    try testing.expectEqual(@as(i32, 1), next_idx);
+    const handles = [_]u32{0x700B};
+    const blocked = scheduler_complete_block_on_handles(sched, cpu, &handles, handles.len, 0x401000, true, 500, next_idx);
+    try testing.expect(blocked);
+    try testing.expectEqual(@as(i32, 1), scheduler_current_idx(sched));
+
+    // Signal the handle: unblock_handle marks thread 0 READY again (does not
+    // itself swap -- it only flips the flag, matching the real Win32
+    // SetEvent-style handler that calls it).
+    const n = scheduler_unblock_handle(sched, 0x700B);
+    try testing.expectEqual(@as(u32, 1), n);
+    try testing.expectEqual(scheduler.ThreadStatus.ready, sched.threads[0].status);
+
+    // tick() advances the virtual clock -- smoke test for the C ABI wiring
+    // itself; the actual wake/deadline-expiry math is covered by
+    // scheduler.zig's own colocated tests.
+    scheduler_tick(sched, 10);
+    try testing.expectEqual(@as(u32, 10), sched.virtual_ticks_ms);
+}
+
+test "public C ABI: scheduler TLS bitset + handle-keyed accessors" {
+    const sched = scheduler_create().?;
+    defer scheduler_destroy(sched);
+    scheduler_create_main_thread(sched, 1000, 0xBEEF);
+    _ = scheduler_create_thread(sched, 1001, 0xBEF0, 0x9F0000, 0x0, false);
+
+    try testing.expect(!scheduler_tls_slot_allocated(sched, 5));
+    scheduler_tls_alloc_slot(sched, 5);
+    try testing.expect(scheduler_tls_slot_allocated(sched, 5));
+    scheduler_tls_free_slot(sched, 5);
+    try testing.expect(!scheduler_tls_slot_allocated(sched, 5));
+
+    try testing.expect(!scheduler_get_suspended(sched, 0xBEF0));
+    scheduler_set_suspended(sched, 0xBEF0, true);
+    try testing.expect(scheduler_get_suspended(sched, 0xBEF0));
+
+    try testing.expectEqual(@as(u32, 0xBEEF), scheduler_current_handle(sched));
+    try testing.expectEqual(@as(i64, 1001), scheduler_get_thread_id(sched, 0xBEF0));
+    try testing.expectEqual(@as(i64, 0xBEF0), scheduler_handle_at_idx(sched, 1));
+    try testing.expectEqual(@as(i64, -1), scheduler_get_thread_id(sched, 0xDEADBEEF));
+
+    try testing.expectEqual(@as(u32, 2), scheduler_thread_count(sched));
+    try testing.expectEqual(@as(u32, 0), scheduler_get_virtual_ticks_ms(sched));
+    scheduler_set_virtual_ticks_ms(sched, 12345);
+    try testing.expectEqual(@as(u32, 12345), scheduler_get_virtual_ticks_ms(sched));
+}
+
+test "public C ABI: scheduler create 2 threads, preempt, block on CS, unblock, verify swap" {
+    const mem = try testing.allocator.alloc(u8, 0x00340000);
+    defer testing.allocator.free(mem);
+    @memset(mem, 0);
+    const cpu = cpu_create(mem.ptr, mem.len).?;
+    defer cpu_destroy(cpu);
+
+    const sched = scheduler_create().?;
+    defer scheduler_destroy(sched);
+    sched.thread_stack_next = 0x1000;
+    scheduler_create_main_thread(sched, 1000, 0xBEEF);
+    _ = scheduler_create_thread(sched, 1001, 0xBEF0, 0x9F0000, 0x0, false);
+
+    // preempt: main (idx 0) -> idx 1, fresh thread, real stack init.
+    try testing.expect(scheduler_preempt_slice(sched, cpu));
+    try testing.expectEqual(@as(i32, 1), scheduler_current_idx(sched));
+    try testing.expectEqual(@as(u32, 0x9F0000), cpu_get_eip(cpu));
+
+    // idx 1 blocks on a contested CS; two-call protocol: resolve next_idx
+    // via pick_next_ready first (finds idx 0, READY), then complete.
+    const next_idx = scheduler_pick_next_ready(sched, cpu);
+    try testing.expectEqual(@as(i32, 0), next_idx);
+    const blocked = scheduler_complete_block_on_cs(sched, cpu, 0xCAFE, 0x9F0010, next_idx);
+    try testing.expect(blocked);
+    try testing.expectEqual(@as(i32, 0), scheduler_current_idx(sched));
+    // eip restored to idx 0's saved state (from the earlier preempt's save),
+    // not 0x9F0010 -- that retry_eip belongs to idx 1's own saved state now.
+    try testing.expectEqual(@as(u32, 0), cpu_get_eip(cpu));
+
+    // unblock: idx 1 becomes READY again but current thread (idx 0) doesn't
+    // move on its own -- unblock_cs only flips the flag, matching the real
+    // LeaveCriticalSection handler that calls it.
+    scheduler_unblock_cs(sched, 0xCAFE);
+    const after_unblock = scheduler_pick_next_ready(sched, cpu);
+    try testing.expectEqual(@as(i32, 1), after_unblock);
+
+    const swapped = scheduler_switch_to(sched, cpu, 1);
+    try testing.expect(swapped);
+    try testing.expectEqual(@as(i32, 1), scheduler_current_idx(sched));
+    try testing.expectEqual(@as(u32, 0x9F0010), cpu_get_eip(cpu)); // idx 1's own retry_eip, restored
 }
