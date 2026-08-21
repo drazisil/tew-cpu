@@ -486,12 +486,31 @@ fn op3D(s: *CpuState) void { // CMP EAX/AX, immv -- see op85's comment
     updateFlagsArithW(s, @as(i64, a) - @as(i64, imm), a, imm, true, width);
 }
 fn opIncR32(comptime r: u3) OpFn { return struct { fn f(s: *CpuState) void {
-    const op1 = s.regs[r]; s.regs[r] = op1 +% 1;
-    const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, op1) + 1, op1, 1, false, .w32); setFlag(s, CF_BIT, cf);
+    // Must honor 0x66 (live-confirmed root cause of DAO-3075): unlike
+    // opMovR32Imm/the rmv-family arithmetic ops in this file, this single-
+    // byte form never checked op_size_ovr, so under a 0x66 prefix it wrote
+    // and flag-checked the full 32-bit register instead of just the low 16
+    // -- silently wrong whenever the upper 16 bits held nonzero leftover
+    // data (e.g. EBP reused earlier in a function as a pointer).
+    const op1 = s.regs[r];
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    if (s.op_size_ovr) {
+        s.regs[r] = (op1 & 0xFFFF0000) | (((op1 & 0xFFFF) +% 1) & 0xFFFF);
+    } else {
+        s.regs[r] = op1 +% 1;
+    }
+    const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, op1) + 1, op1, 1, false, width); setFlag(s, CF_BIT, cf);
 }}.f; }
 fn opDecR32(comptime r: u3) OpFn { return struct { fn f(s: *CpuState) void {
-    const op1 = s.regs[r]; s.regs[r] = op1 -% 1;
-    const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, op1) - 1, op1, 1, true, .w32); setFlag(s, CF_BIT, cf);
+    // See opIncR32 above -- same bug, same fix.
+    const op1 = s.regs[r];
+    const width: Width = if (s.op_size_ovr) .w16 else .w32;
+    if (s.op_size_ovr) {
+        s.regs[r] = (op1 & 0xFFFF0000) | (((op1 & 0xFFFF) -% 1) & 0xFFFF);
+    } else {
+        s.regs[r] = op1 -% 1;
+    }
+    const cf = getFlag(s, CF_BIT); updateFlagsArithW(s, @as(i64, op1) - 1, op1, 1, true, width); setFlag(s, CF_BIT, cf);
 }}.f; }
 fn op69(s: *CpuState) void { // IMUL r32, rm32, imm32
     const d = decodeModRM(s);
@@ -1709,6 +1728,34 @@ test "INC rm32 Group5 (0xFF /0) is width-aware: 16-bit 0x7FFF+1 overflow" {
     try testing.expect(getFlag(&s, OF_BIT));
 }
 
+test "DEC r32 (0x48+r single-byte form) is width-aware: 16-bit 1-1 zero flag not masked by upper-16 garbage" {
+    // Live-confirmed root cause of DAO-3075 (MCity_d.exe / msjet35.dll SELECT-
+    // list parser): "66 4D" = DEC BP inside a paren-depth counter loop. BP=1,
+    // decremented once, should reach 0 and set ZF so the loop falls through.
+    // opDecR32 unconditionally used .w32 for both the register write and the
+    // flag computation, ignoring op_size_ovr entirely (unlike opMovR32Imm/
+    // arithmetic ops in this same file, which already handle it) -- so with
+    // real leftover garbage in EBP's upper 16 bits (e.g. from earlier use as
+    // a pointer), the 32-bit-wide decrement never actually reached zero and
+    // ZF came out clear, sending the paren-skip loop back for another token
+    // instead of falling through to the match-check that was waiting for it.
+    var mem = [_]u8{0x66, 0x4D} ++ [_]u8{0} ** 62; // dec bp
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EBP] = 0x12340001; // BP=1, upper 16 = sentinel 0x1234 (real-world garbage)
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12340000), s.regs[EBP]); // BP=0, upper preserved
+    try testing.expect(getFlag(&s, ZF_BIT));
+}
+
+test "INC r32 (0x40+r single-byte form) is width-aware: 16-bit 0xFFFF+1 wraps within the low 16, upper untouched" {
+    var mem = [_]u8{0x66, 0x40} ++ [_]u8{0} ** 62; // inc ax
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x1234FFFF; // AX=0xFFFF, upper 16 = sentinel 0x1234
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x12340000), s.regs[EAX]); // AX=0, upper preserved
+    try testing.expect(getFlag(&s, ZF_BIT));
+}
+
 test "INC dword ptr [disp32] (Group5 0xFF /0) advances EIP by 6, not 10 (regression: resolveRm's fetch32 consumed the disp32 twice)" {
     // Live-confirmed regression: authlogin.dll's SBH allocator does
     // `inc dword ptr ds:0x1000dbb8` (ff 05 <disp32>, no 0x66 prefix -- this
@@ -1832,6 +1879,39 @@ test "doGroup2 SAR EAX,1 sets CF to the shifted-out bit" {
     cpuStep(&s);
     try testing.expectEqual(@as(u32, 0x00000001), s.regs[EAX]);
     try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "doGroup2 SHL EAX,0xB truncates to 32 bits on a large shift count" {
+    // shl eax,0xB with EAX=0x071B0748: a naive full-precision multiply
+    // (val * 2048) would produce ~3.63GB, exceeding 32 bits. Real x86
+    // SHL discards bits shifted past bit 31 -- verified by hand against
+    // the msjet35.dll B-tree investigation's page-cache key->offset
+    // computation (FUN_7a842abc caller, `C1 E0 0B` in the real DLL).
+    var mem = [_]u8{0xC1, 0xE0, 0x0B} ++ [_]u8{0} ** 61; // shl eax,0xB
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x071B0748;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0xD83A4000), s.regs[EAX]);
+}
+
+test "JGE (0x7D) taken when SF==OF -- signed comparison result >= 0" {
+    // cmp eax,0 ; jge +2 ; nop ; nop  -- EAX=0: ZF=1,SF=0,OF=0 -> SF==OF -> taken
+    var mem = [_]u8{ 0x83, 0xF8, 0x00, 0x7D, 0x02, 0x90, 0x90 } ++ [_]u8{0} ** 57;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0;
+    cpuStep(&s); // cmp
+    cpuStep(&s); // jge
+    try testing.expectEqual(@as(u32, 7), s.eip);
+}
+
+test "JGE (0x7D) not taken when SF!=OF -- signed comparison result < 0" {
+    // cmp eax,0 ; jge +2 ; nop ; nop  -- EAX=-1: result=-1, SF=1,OF=0 -> SF!=OF -> not taken
+    var mem = [_]u8{ 0x83, 0xF8, 0x00, 0x7D, 0x02, 0x90, 0x90 } ++ [_]u8{0} ** 57;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0xFFFFFFFF;
+    cpuStep(&s); // cmp
+    cpuStep(&s); // jge
+    try testing.expectEqual(@as(u32, 5), s.eip);
 }
 
 // ─── Ported-from-pe-walker instruction coverage (2026-08-06) ─────────────────
