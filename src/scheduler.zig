@@ -26,6 +26,7 @@ const testing = std.testing;
 pub const TEB_BASE: u32 = 0x00320000;
 const TLS_TEB_OFFSET: u32 = 0xE0;
 const LAST_ERROR_TEB_OFFSET: u32 = 0x34;
+const EXCEPTION_LIST_TEB_OFFSET: u32 = 0x00; // NT_TIB.ExceptionList, real Windows offset
 pub const THREAD_STACK_BASE: u32 = 0x08000000;
 pub const THREAD_STACK_SIZE: u32 = 256 * 1024;
 pub const THREAD_SENTINEL: u32 = 0x001FE000;
@@ -67,6 +68,14 @@ pub const ThreadEntry = struct {
     saved: SavedRegs = .{},
     tls_values: [TLS_MAX_SLOTS]u32 = .{0} ** TLS_MAX_SLOTS,
     last_error: u32 = 0,
+    // TEB_BASE is one fixed address shared by every thread (no real
+    // per-thread TEB) -- must be saved/restored across every context
+    // switch exactly like last_error just above, or one thread's SEH
+    // chain head silently leaks into another's. 0xFFFFFFFF is the real
+    // Windows "empty chain" terminator, matching a fresh thread's real
+    // initial state (kernel_structures.py's own TEB init writes the same
+    // value for the same field).
+    exception_list: u32 = 0xFFFFFFFF,
     waiting_on_cs: u32 = 0, // 0 = sentinel "not waiting" -- no legit guest CS pointer is ever 0
     wait_handles: [MAX_WAIT_HANDLES]u32 = .{0} ** MAX_WAIT_HANDLES,
     wait_handle_count: u8 = 0,
@@ -153,12 +162,14 @@ pub fn saveCurrent(sched: *SchedulerState, cpu: *CpuState) void {
     t.has_run = true;
     saveTls(sched, cpu, t);
     t.last_error = core.memRead32(cpu, TEB_BASE + LAST_ERROR_TEB_OFFSET);
+    t.exception_list = core.memRead32(cpu, TEB_BASE + EXCEPTION_LIST_TEB_OFFSET);
 }
 
 pub fn loadThread(sched: *SchedulerState, cpu: *CpuState, idx: u32) void {
     const t = &sched.threads[idx];
     loadTls(sched, cpu, t);
     core.memWrite32(cpu, TEB_BASE + LAST_ERROR_TEB_OFFSET, t.last_error);
+    core.memWrite32(cpu, TEB_BASE + EXCEPTION_LIST_TEB_OFFSET, t.exception_list);
     cpu.regs = t.saved.regs;
     cpu.eip = t.saved.eip;
     cpu.eflags = t.saved.eflags;
@@ -184,6 +195,7 @@ pub fn initThreadStack(sched: *SchedulerState, cpu: *CpuState, idx: u32) void {
     esp -%= 4;
     core.memWrite32(cpu, esp, THREAD_SENTINEL);
     core.memWrite32(cpu, TEB_BASE + LAST_ERROR_TEB_OFFSET, t.last_error); // fresh thread: last_error=0
+    core.memWrite32(cpu, TEB_BASE + EXCEPTION_LIST_TEB_OFFSET, t.exception_list); // fresh thread: empty SEH chain
     cpu.regs[EAX] = 0;
     cpu.regs[ECX] = 0;
     cpu.regs[EDX] = 0;
@@ -832,6 +844,43 @@ test "switch_to loads saved state on resume" {
     try testing.expectEqual(@as(i32, 1), sched.current_idx);
     try testing.expectEqual(@as(u32, 0x9F1234), cpu.eip);
     try testing.expectEqual(@as(u32, 0x42), cpu.regs[EAX]);
+}
+
+test "fresh thread starts with an empty (0xFFFFFFFF-terminated) SEH chain" {
+    // Live-confirmed bug: TEB_BASE is a single fixed address shared by every
+    // thread (no real per-thread TEB), and until now nothing saved/restored
+    // ExceptionList (TEB+0x00) across a context switch the way last_error
+    // (TEB+0x34) already does. A dispatched exception's SEH walk
+    // (tew/kernel/seh.py's dispatch_exception, reading fs:[0] via this same
+    // shared TEB_BASE) legitimately followed real frames pushed by SIX
+    // DIFFERENT threads before giving up, each 0x40000 (THREAD_STACK_SIZE)
+    // apart -- a genuinely corrupted, cross-thread-contaminated chain, not a
+    // real single-thread SEH chain that happened to be long.
+    var sched = twoThreadSched();
+    const mem = try allocTestMem();
+    defer testing.allocator.free(mem);
+    var cpu = testCpu(mem);
+    core.memWrite32(&cpu, TEB_BASE + 0x00, 0x12345678); // simulate thread 0 having pushed a real frame
+
+    _ = switchTo(&sched, &cpu, 1); // fresh thread -> initThreadStack path
+
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), core.memRead32(&cpu, TEB_BASE + 0x00));
+}
+
+test "switch_to saves the outgoing thread's own ExceptionList and restores it on resume" {
+    var sched = twoThreadSched();
+    const mem = try allocTestMem();
+    defer testing.allocator.free(mem);
+    var cpu = testCpu(mem);
+    core.memWrite32(&cpu, TEB_BASE + 0x00, 0xAAAAAAAA); // thread 0's own SEH chain head
+
+    _ = switchTo(&sched, &cpu, 1); // thread 0 saved, thread 1 (fresh) loaded
+    try testing.expectEqual(@as(u32, 0xAAAAAAAA), sched.threads[0].exception_list);
+
+    core.memWrite32(&cpu, TEB_BASE + 0x00, 0xBBBBBBBB); // thread 1 pushes its own frame
+    _ = switchTo(&sched, &cpu, 0); // back to thread 0
+
+    try testing.expectEqual(@as(u32, 0xAAAAAAAA), core.memRead32(&cpu, TEB_BASE + 0x00));
 }
 
 test "switch_to clears cpu.halted after load" {
