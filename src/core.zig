@@ -72,6 +72,17 @@ pub const CpuState = struct {
     mmx_regs: [8]u64 = .{0} ** 8,
     halted: bool = false,
     faulted: bool = false,
+    // Opt-in null-page guard (default off so every existing test's
+    // address-0-based tiny buffers stay unaffected -- see
+    // cpu_enable_null_page_guard in kernel.zig). Real Windows never maps
+    // the first 64KB of address space in any 32-bit process; some guest
+    // code (MCity_d.exe's own anti-debug self-test, _CLayer_DetectDebugger)
+    // deliberately reads a low address specifically to provoke a real
+    // access violation and detect whether its own SEH handler runs (no
+    // debugger) or a debugger intercepts first. Without a genuinely-
+    // unmapped low range, that self-test can never fault at all, so its
+    // "no debugger" correction path never executes.
+    guard_null_page: bool = false,
     // Set only via cpu_set_fatal_halt -- means the emulator hit something it
     // cannot simulate (e.g. an unimplemented Win32 API), not a real x86
     // condition. Once true, permanent for the lifetime of this CpuState:
@@ -130,8 +141,19 @@ pub const Rm32Result = struct { value: u32, is_reg: bool, addr: u32 };
 pub const ModRm = struct { mod: u8, reg: u8, rm: u8 };
 
 // ─── Memory access ────────────────────────────────────────────────────────────
+// Real Windows never maps the first 64KB of address space ("the null page")
+// in any 32-bit process -- a deliberate OS guarantee to catch null-pointer
+// bugs. Only enforced when CpuState.guard_null_page is set (see its comment
+// on the struct field above) so every existing test's tiny address-0-based
+// buffers stay exactly as they were.
+pub const NULL_PAGE_SIZE: u32 = 0x10000;
+
+fn isFaultingAddr(s: *const CpuState, addr: u32) bool {
+    return !primitives.inBounds1(s.memory_size, addr) or (s.guard_null_page and addr < NULL_PAGE_SIZE);
+}
+
 pub inline fn memRead8(s: *CpuState, addr: u32) u8 {
-    if (!primitives.inBounds1(s.memory_size, addr)) { s.faulted = true; s.halted = true; return 0; }
+    if (isFaultingAddr(s, addr)) { s.faulted = true; s.halted = true; return 0; }
     return primitives.readByte(s.memory, addr);
 }
 pub inline fn memRead16(s: *CpuState, addr: u32) u16 {
@@ -143,7 +165,7 @@ pub inline fn memRead32(s: *CpuState, addr: u32) u32 {
 }
 pub inline fn memReadS32(s: *CpuState, addr: u32) i32 { return @bitCast(memRead32(s, addr)); }
 pub inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
-    if (!primitives.inBounds1(s.memory_size, addr)) { s.faulted = true; s.halted = true; return; }
+    if (isFaultingAddr(s, addr)) { s.faulted = true; s.halted = true; return; }
     if (s.watchpoint != 0 and addr == s.watchpoint) {
         s.watchpoint_eip = s.eip;
         s.watchpoint_val = v;

@@ -145,6 +145,14 @@ export fn cpu_set_fatal_halt(s: *CpuState) void {
     s.halted = true;
 }
 export fn cpu_is_fatal_halted(s: *CpuState) bool { return s.fatal_halted; }
+
+// Opt-in null-page guard (see CpuState.guard_null_page's comment in
+// core.zig): real emulator startup calls this once; unit tests constructing
+// a bare CpuState never do, so their tiny address-0-based buffers are
+// unaffected by default.
+export fn cpu_enable_null_page_guard(s: *CpuState) void {
+    s.guard_null_page = true;
+}
 export fn cpu_get_step_count(s: *CpuState) u64 { return s.step_count; }
 export fn cpu_get_run_id(s: *CpuState) u64 { return s.run_id; }
 export fn cpu_get_last_opcode(s: *CpuState) u8 { return s.last_opcode; }
@@ -613,6 +621,60 @@ test "public C ABI: out-of-bounds fetch faults, not crashes" {
     const result = cpu_run(s, 10);
     try testing.expectEqual(RunResult.faulted, result);
     try testing.expect(cpu_is_faulted(s));
+}
+
+test "public C ABI: null-page guard disabled by default -- low-address code/data still work" {
+    // mov al, [0x190]; hlt -- a genuine data read from a low address, same
+    // shape as MCity_d.exe's own anti-debug self-test (_CLayer_DetectDebugger
+    // reading 0x00000190). Buffer is well over 0x190 bytes so both the
+    // instruction fetch (near address 0) and the data read (at 0x190) are
+    // in-bounds; with the guard off (the default every existing test in this
+    // file already relies on), neither should fault.
+    var mem = [_]u8{0} ** 0x400;
+    mem[0] = 0xA0; // MOV AL, moffs8
+    mem[1] = 0x90; mem[2] = 0x01; mem[3] = 0x00; mem[4] = 0x00; // addr = 0x00000190 (LE)
+    mem[5] = 0xF4; // hlt
+    const s = cpu_create(&mem, mem.len).?;
+    defer cpu_destroy(s);
+    const result = cpu_run(s, 10);
+    try testing.expectEqual(RunResult.halted, result);
+    try testing.expect(!cpu_is_faulted(s));
+}
+
+test "public C ABI: null-page guard, once enabled, faults a real data read at a low address" {
+    var mem = [_]u8{0} ** 0x400;
+    mem[0] = 0xA0; // MOV AL, moffs8
+    mem[1] = 0x90; mem[2] = 0x01; mem[3] = 0x00; mem[4] = 0x00; // addr = 0x00000190 (LE)
+    const s = cpu_create(&mem, mem.len).?;
+    defer cpu_destroy(s);
+    cpu_enable_null_page_guard(s);
+    const result = cpu_run(s, 2);
+    try testing.expectEqual(RunResult.faulted, result);
+    try testing.expect(cpu_is_faulted(s));
+}
+
+test "public C ABI: null-page guard, once enabled, still allows addresses at and above 0x10000" {
+    // Same mov al,[addr] shape, but this time addr is exactly NULL_PAGE_SIZE
+    // -- the boundary itself must remain valid, only addresses strictly
+    // below it are guarded. The code itself is placed well above 0x10000
+    // too (via cpu_set_eip), not at address 0 like the other tests here --
+    // with the guard enabled, a low-address code fetch would fault on its
+    // own, which isn't what this test is isolating.
+    const size: usize = 0x10100;
+    const mem = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(mem);
+    @memset(mem, 0);
+    const code_addr: u32 = 0x10010;
+    mem[code_addr] = 0xA0; // MOV AL, moffs8
+    mem[code_addr + 1] = 0x00; mem[code_addr + 2] = 0x00; mem[code_addr + 3] = 0x01; mem[code_addr + 4] = 0x00; // addr = 0x00010000 (LE)
+    mem[code_addr + 5] = 0xF4; // hlt
+    const s = cpu_create(mem.ptr, mem.len).?;
+    defer cpu_destroy(s);
+    cpu_enable_null_page_guard(s);
+    cpu_set_eip(s, code_addr);
+    const result = cpu_run(s, 10);
+    try testing.expectEqual(RunResult.halted, result); // in-bounds, guard doesn't apply here
+    try testing.expect(!cpu_is_faulted(s));
 }
 
 test "public C ABI: scheduler create -> thread creation -> preempt_slice -> destroy" {
