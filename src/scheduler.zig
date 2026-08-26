@@ -188,8 +188,26 @@ pub fn loadThread(sched: *SchedulerState, cpu: *CpuState, idx: u32) void {
 
 pub fn initThreadStack(sched: *SchedulerState, cpu: *CpuState, idx: u32) void {
     const t = &sched.threads[idx];
-    const stack_top = sched.thread_stack_next +% THREAD_STACK_SIZE -% 16;
+    const stack_base = sched.thread_stack_next;
+    const stack_top = stack_base +% THREAD_STACK_SIZE -% 16;
     sched.thread_stack_next +%= THREAD_STACK_SIZE;
+    // Real Windows guarantees a freshly-committed thread stack is zero-filled
+    // on first use (same virtual-memory guarantee as a fresh VirtualAlloc
+    // page) -- real, unpatchable DLL code (msjet35.dll's FUN_7a8a4975) reads
+    // uninitialized locals on some paths and relies on this implicit zero,
+    // which a real Microsoft debug-build stack-fill pattern would also mask
+    // in a debug build, but this is release-compiled code. Without this,
+    // tew's thread stacks start with whatever was in the backing buffer
+    // (usually zero at process start, but not guaranteed at every offset),
+    // and differ from real Windows' actual leftover stack content anyway
+    // since tew's own call history through this point is structurally
+    // different (Python-handled Win32/CRT internals leave no comparable
+    // stack footprint) -- zeroing on thread creation is the one guarantee
+    // both platforms actually share, not an attempt to replicate real
+    // Windows' specific (unknowable, call-history-dependent) garbage.
+    if (stack_base +% THREAD_STACK_SIZE <= cpu.memory_size) {
+        @memset(cpu.memory[stack_base..][0..THREAD_STACK_SIZE], 0);
+    }
     var esp = stack_top -% 4;
     core.memWrite32(cpu, esp, t.parameter);
     esp -%= 4;

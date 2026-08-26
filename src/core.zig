@@ -157,11 +157,11 @@ pub inline fn memRead8(s: *CpuState, addr: u32) u8 {
     return primitives.readByte(s.memory, addr);
 }
 pub inline fn memRead16(s: *CpuState, addr: u32) u16 {
-    return @as(u16, memRead8(s, addr)) | (@as(u16, memRead8(s, addr + 1)) << 8);
+    return @as(u16, memRead8(s, addr)) | (@as(u16, memRead8(s, addr +% 1)) << 8);
 }
 pub inline fn memRead32(s: *CpuState, addr: u32) u32 {
-    return @as(u32, memRead8(s, addr)) | (@as(u32, memRead8(s, addr + 1)) << 8) |
-           (@as(u32, memRead8(s, addr + 2)) << 16) | (@as(u32, memRead8(s, addr + 3)) << 24);
+    return @as(u32, memRead8(s, addr)) | (@as(u32, memRead8(s, addr +% 1)) << 8) |
+           (@as(u32, memRead8(s, addr +% 2)) << 16) | (@as(u32, memRead8(s, addr +% 3)) << 24);
 }
 pub inline fn memReadS32(s: *CpuState, addr: u32) i32 { return @bitCast(memRead32(s, addr)); }
 pub inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
@@ -184,13 +184,13 @@ pub inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
 }
 pub inline fn memWrite16(s: *CpuState, addr: u32, v: u16) void {
     memWrite8(s, addr, @truncate(v));
-    memWrite8(s, addr + 1, @truncate(v >> 8));
+    memWrite8(s, addr +% 1, @truncate(v >> 8));
 }
 pub inline fn memWrite32(s: *CpuState, addr: u32, v: u32) void {
     memWrite8(s, addr, @truncate(v));
-    memWrite8(s, addr + 1, @truncate(v >> 8));
-    memWrite8(s, addr + 2, @truncate(v >> 16));
-    memWrite8(s, addr + 3, @truncate(v >> 24));
+    memWrite8(s, addr +% 1, @truncate(v >> 8));
+    memWrite8(s, addr +% 2, @truncate(v >> 16));
+    memWrite8(s, addr +% 3, @truncate(v >> 24));
 }
 
 // ─── Fetch helpers ────────────────────────────────────────────────────────────
