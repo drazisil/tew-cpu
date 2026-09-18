@@ -627,6 +627,11 @@ fn opD3(s: *CpuState) void { // Group 2: shift rmv, CL -- see opC1's comment
     const width: Width = if (s.op_size_ovr) .w16 else .w32;
     doGroup2(s, res.is_reg, res.addr, d.reg, res.value, @truncate(s.regs[ECX] & 0x1F), width);
 }
+fn opD7(s: *CpuState) void { // XLAT/XLATB: AL = [seg:EBX + AL]
+    const al: u32 = s.regs[EAX] & 0xFF;
+    const v = memRead8(s, applySegOvr(s, s.regs[EBX] +% al));
+    s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | v;
+}
 fn opF6(s: *CpuState) void { // Group 3 byte
     const d = decodeModRM(s); const val = readRm8(s, d.mod, d.rm);
     switch (d.reg) {
@@ -1338,7 +1343,7 @@ const dispatch_table: [256]OpFn = dt: {
     t[0xAA] = opAA; t[0xAB] = opAB; t[0xAC] = opAC; t[0xAD] = opAD; t[0xAE] = opAE; t[0xAF] = opAF;
     t[0xC0] = opC0; t[0xC1] = opC1; t[0xC2] = opC2; t[0xC3] = opC3; t[0xC4] = opC4; t[0xC5] = opC5;
     t[0xC6] = opC6; t[0xC7] = opC7; t[0xC8] = opC8; t[0xC9] = opC9; t[0xCC] = opCC; t[0xCD] = opCD;
-    t[0xD0] = opD0; t[0xD1] = opD1; t[0xD2] = opD2; t[0xD3] = opD3;
+    t[0xD0] = opD0; t[0xD1] = opD1; t[0xD2] = opD2; t[0xD3] = opD3; t[0xD7] = opD7;
     t[0xD8] = fpu.opD8; t[0xD9] = fpu.opD9; t[0xDA] = fpu.opDA; t[0xDB] = fpu.opDB;
     t[0xDC] = fpu.opDC; t[0xDD] = fpu.opDD; t[0xDE] = fpu.opDE; t[0xDF] = fpu.opDF;
     t[0xE0] = opE0; t[0xE1] = opE1; t[0xE2] = opE2; t[0xE3] = opE3;
@@ -1938,6 +1943,272 @@ test "opFault sets unknown_opcode and last_instr_eip points at the missing opcod
     try testing.expect(s.unknown_opcode);
     try testing.expectEqual(@as(u32, 0), s.last_instr_eip);
     try testing.expectEqual(@as(u8, 0xF1), s.last_opcode);
+}
+
+test "0F AB: BTS rm32,r32 sets CF to the tested bit and sets the bit" {
+    // Regression coverage for a real crash found live 2026-09-18, same
+    // session as opD0/op34: BT (0x0F 0xA3) and the Group 8 imm8 form
+    // (0x0F 0xBA) were wired, but the register-form BTS/BTR/BTC
+    // (0x0F 0xAB/0xB3/0xBB) were not -- two_byte.zig's op0F fell through
+    // to its own separate unknown-opcode fault path (distinct from
+    // dispatch_table's opFault), which this fix also wired into the same
+    // unknown_opcode diagnostic. bts eax,ecx with EAX=0, ECX=3 (bit 3):
+    // bit was 0 (CF clear), then gets set.
+    var mem = [_]u8{0x0F, 0xAB, 0xC8} ++ [_]u8{0} ** 61; // bts eax,ecx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0; s.regs[ECX] = 3;
+    cpuStep(&s);
+    try testing.expect(!s.faulted);
+    try testing.expect(!s.unknown_opcode);
+    try testing.expect(!getFlag(&s, CF_BIT));
+    try testing.expectEqual(@as(u32, 0x8), s.regs[EAX]);
+}
+
+test "0F B3: BTR rm32,r32 clears the tested bit" {
+    var mem = [_]u8{0x0F, 0xB3, 0xC8} ++ [_]u8{0} ** 61; // btr eax,ecx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x8; s.regs[ECX] = 3;
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, CF_BIT));
+    try testing.expectEqual(@as(u32, 0), s.regs[EAX]);
+}
+
+test "0F BB: BTC rm32,r32 toggles the tested bit" {
+    var mem = [_]u8{0x0F, 0xBB, 0xC8} ++ [_]u8{0} ** 61; // btc eax,ecx
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x8; s.regs[ECX] = 3;
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, CF_BIT));
+    try testing.expectEqual(@as(u32, 0), s.regs[EAX]);
+}
+
+fn runFistp32(val: f80, cw: u16, status_out: *u16) i32 {
+    var mem = [_]u8{ 0xDB, 0x1D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58; // fistp dword [0x20]
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.fpu_control_word = cw;
+    s.fpu_top = 0;
+    s.fpu_stack[0] = val;
+    cpuStep(&s);
+    status_out.* = s.fpu_status_word;
+    return @bitCast(std.mem.readInt(u32, mem[0x20..0x24], .little));
+}
+
+test "FISTP m32 default rounding is nearest-EVEN, not half-away-from-zero" {
+    var st: u16 = 0;
+    try testing.expectEqual(@as(i32, 2), runFistp32(2.5, 0x037F, &st));
+    try testing.expectEqual(@as(i32, 4), runFistp32(3.5, 0x037F, &st));
+    try testing.expectEqual(@as(i32, -2), runFistp32(-2.5, 0x037F, &st));
+    try testing.expectEqual(@as(i32, 3), runFistp32(2.6, 0x037F, &st));
+    try testing.expectEqual(@as(i32, 0), runFistp32(-0.5, 0x037F, &st));
+    try testing.expectEqual(@as(u16, 0), st & 1); // exact/in-range: IE stays clear
+}
+
+test "FISTP m32 honors the FLDCW rounding-control bits" {
+    var st: u16 = 0;
+    try testing.expectEqual(@as(i32, 2), runFistp32(2.9, 0x0F7F, &st)); // RC=11 truncate
+    try testing.expectEqual(@as(i32, -2), runFistp32(-2.9, 0x0F7F, &st));
+    try testing.expectEqual(@as(i32, 2), runFistp32(2.1, 0x077F, &st)); // RC=01 down
+    try testing.expectEqual(@as(i32, -3), runFistp32(-2.1, 0x077F, &st));
+    try testing.expectEqual(@as(i32, 3), runFistp32(2.1, 0x0B7F, &st)); // RC=10 up
+    try testing.expectEqual(@as(i32, -2), runFistp32(-2.9, 0x0B7F, &st));
+}
+
+test "FISTP m32 on NaN/Inf/out-of-range stores integer indefinite and sets IE -- never panics the host" {
+    // Found live 2026-09-18: @intFromFloat here aborted the whole emulator
+    // process (SIGABRT) the first time the game's math path fed FISTP a value
+    // that didn't fit an i32.
+    const indefinite: i32 = std.math.minInt(i32);
+    var st: u16 = 0;
+    try testing.expectEqual(indefinite, runFistp32(std.math.nan(f80), 0x037F, &st));
+    try testing.expectEqual(@as(u16, 1), st & 1);
+    st = 0;
+    try testing.expectEqual(indefinite, runFistp32(std.math.inf(f80), 0x037F, &st));
+    try testing.expectEqual(@as(u16, 1), st & 1);
+    try testing.expectEqual(indefinite, runFistp32(-std.math.inf(f80), 0x037F, &st));
+    try testing.expectEqual(indefinite, runFistp32(3.0e9, 0x037F, &st));
+    try testing.expectEqual(indefinite, runFistp32(-3.0e9, 0x037F, &st));
+    try testing.expectEqual(indefinite, runFistp32(1.0e30, 0x037F, &st));
+    // Boundaries: max i32 is representable; max+0.6 rounds to 2^31 -> out of range.
+    st = 0;
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), runFistp32(2147483647.0, 0x037F, &st));
+    try testing.expectEqual(@as(u16, 0), st & 1);
+    try testing.expectEqual(indefinite, runFistp32(2147483647.6, 0x037F, &st));
+}
+
+test "FISTP m16 and m64 out-of-range store their own width's integer indefinite" {
+    var mem16 = [_]u8{ 0xDF, 0x1D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58; // fistp word [0x20]
+    var s16 = CpuState{ .memory = &mem16, .memory_size = mem16.len };
+    s16.fpu_top = 0;
+    s16.fpu_stack[0] = 40000.0;
+    cpuStep(&s16);
+    try testing.expectEqual(@as(u16, 0x8000), std.mem.readInt(u16, mem16[0x20..0x22], .little));
+
+    var mem64 = [_]u8{ 0xDF, 0x3D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58; // fistp qword [0x20]
+    var s64 = CpuState{ .memory = &mem64, .memory_size = mem64.len };
+    s64.fpu_top = 0;
+    s64.fpu_stack[0] = 1.0e30;
+    cpuStep(&s64);
+    try testing.expectEqual(@as(u64, 0x8000000000000000), std.mem.readInt(u64, mem64[0x20..0x28], .little));
+
+    // 2^53+1 is exact in f80's 64-bit mantissa and must survive the m64 store.
+    var memx = [_]u8{ 0xDF, 0x3D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58;
+    var sx = CpuState{ .memory = &memx, .memory_size = memx.len };
+    sx.fpu_top = 0;
+    sx.fpu_stack[0] = 9007199254740993.0;
+    cpuStep(&sx);
+    try testing.expectEqual(@as(u64, 9007199254740993), std.mem.readInt(u64, memx[0x20..0x28], .little));
+}
+
+test "FSCALE with a huge or NaN scale no longer panics the host" {
+    var mem = [_]u8{ 0xD9, 0xFD } ++ [_]u8{0} ** 62; // fscale
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.fpu_top = 0;
+    s.fpu_stack[0] = 1.0;
+    s.fpu_stack[1] = 1.0e30;
+    cpuStep(&s);
+    try testing.expect(std.math.isInf(s.fpu_stack[0]));
+
+    var mem2 = [_]u8{ 0xD9, 0xFD } ++ [_]u8{0} ** 62;
+    var s2 = CpuState{ .memory = &mem2, .memory_size = mem2.len };
+    s2.fpu_top = 0;
+    s2.fpu_stack[0] = 1.0;
+    s2.fpu_stack[1] = std.math.nan(f80);
+    cpuStep(&s2);
+    try testing.expect(std.math.isNan(s2.fpu_stack[0]));
+
+    var mem3 = [_]u8{ 0xD9, 0xFD } ++ [_]u8{0} ** 62; // ordinary: 3 * 2^2 = 12
+    var s3 = CpuState{ .memory = &mem3, .memory_size = mem3.len };
+    s3.fpu_top = 0;
+    s3.fpu_stack[0] = 3.0;
+    s3.fpu_stack[1] = 2.0;
+    cpuStep(&s3);
+    try testing.expectEqual(@as(f80, 12.0), s3.fpu_stack[0]);
+}
+
+test "D7: XLAT loads AL from [EBX+AL], leaves the rest of EAX and all flags alone" {
+    // Found live 2026-09-18 as the first real hit of the restored
+    // unknown-opcode diagnostic: the CRT's __trandisp2 (x87 math-error
+    // dispatch, behind pow/atan2/fmod) translates an operand-class code
+    // through a 256-byte table with XLAT.
+    var mem = [_]u8{ 0xD7, 0x90 } ++ [_]u8{0} ** 62;
+    mem[32 + 5] = 0xAB; // table at 32, index 5
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EBX] = 32;
+    s.regs[EAX] = 0xDEADBE05; // AL = 5, upper bits must survive
+    s.eflags = 0x246;
+    cpuStep(&s);
+    try testing.expect(!s.faulted);
+    try testing.expect(!s.unknown_opcode);
+    try testing.expectEqual(@as(u32, 1), s.eip);
+    try testing.expectEqual(@as(u32, 0xDEADBEAB), s.regs[EAX]);
+    try testing.expectEqual(@as(u32, 0x246), s.eflags);
+}
+
+test "0F AB 04 24: BTS [esp],eax resolves its SIB operand ONCE (EIP lands right after it)" {
+    // The exact shape from the game's static CRT (strspn-style char-set
+    // bitmap on the stack, 0x009f3ffb): `0f ab 04 24` followed by `eb f3`.
+    // The old code fetched the SIB byte twice (read + write each re-resolved
+    // the operand), so EIP ended at 5, having swallowed the JMP's opcode 0xEB
+    // as a phantom SIB -- which then faulted one byte into the next
+    // instruction. EIP must be exactly 4.
+    var mem = [_]u8{ 0x0F, 0xAB, 0x04, 0x24, 0xEB, 0xF3 } ++ [_]u8{0} ** 58;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ESP] = 32;
+    s.regs[EAX] = 37; // bit 37 -> dword at esp+4 (32+4=36), bit 5
+    cpuStep(&s);
+    try testing.expect(!s.faulted);
+    try testing.expectEqual(@as(u32, 4), s.eip);
+    try testing.expect(!getFlag(&s, CF_BIT));
+    try testing.expectEqual(@as(u8, 0x20), mem[36]);
+    try testing.expectEqual(@as(u8, 0), mem[32]); // NOT wrapped into the first dword
+}
+
+test "0F A3 04 24: BT [esp],eax with offset > 31 tests the dword at base+4*(off>>5), no write" {
+    var mem = [_]u8{ 0x0F, 0xA3, 0x04, 0x24 } ++ [_]u8{0} ** 60;
+    mem[36] = 0x20;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ESP] = 32;
+    s.regs[EAX] = 37;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 4), s.eip);
+    try testing.expect(getFlag(&s, CF_BIT));
+    try testing.expectEqual(@as(u8, 0x20), mem[36]);
+}
+
+test "0F AB 04 24: BTS [esp],eax with a NEGATIVE offset reaches below base" {
+    // eax = -3: (-3 >> 5) = -1 -> dword at esp-4 (36), bit (-3 & 31) = 29 ->
+    // byte 3 of that dword (mem[39]), bit 5.
+    var mem = [_]u8{ 0x0F, 0xAB, 0x04, 0x24 } ++ [_]u8{0} ** 60;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ESP] = 40;
+    s.regs[EAX] = 0xFFFFFFFD;
+    cpuStep(&s);
+    try testing.expect(!s.faulted);
+    try testing.expectEqual(@as(u8, 0x20), mem[39]);
+}
+
+test "0F BA /5 ib: BTS dword [esp],5 -- SIB before imm8, EIP ends after the imm8" {
+    // Encoding: 0F BA, ModRM 2C (mod 0, /5, rm 4 -> SIB), SIB 24 ([esp]), imm8.
+    // The old code fetched the imm8 BEFORE resolving the operand, so it read
+    // the SIB byte (0x24 = 36, & 31 = 4) as the bit offset.
+    var mem = [_]u8{ 0x0F, 0xBA, 0x2C, 0x24, 0x05, 0xEB, 0xF3 } ++ [_]u8{0} ** 57;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ESP] = 32;
+    cpuStep(&s);
+    try testing.expect(!s.faulted);
+    try testing.expectEqual(@as(u32, 5), s.eip);
+    try testing.expect(!getFlag(&s, CF_BIT));
+    try testing.expectEqual(@as(u8, 0x20), mem[32]);
+}
+
+test "0F BA /5 ib: imm8 above 31 wraps mod 32 within the SAME dword (no displacement, unlike the register form)" {
+    var mem = [_]u8{ 0x0F, 0xBA, 0x2C, 0x24, 0x25 } ++ [_]u8{0} ** 59; // bts [esp], 37
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ESP] = 32;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u8, 0x20), mem[32]);
+    try testing.expectEqual(@as(u8, 0), mem[36]);
+}
+
+test "0F BA /4 ib: BT sets CF and writes nothing; register form BTS updates the register" {
+    var mem = [_]u8{ 0x0F, 0xBA, 0x24, 0x24, 0x05 } ++ [_]u8{0} ** 59; // bt [esp], 5
+    mem[32] = 0x20;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ESP] = 32;
+    cpuStep(&s);
+    try testing.expect(getFlag(&s, CF_BIT));
+    try testing.expectEqual(@as(u8, 0x20), mem[32]);
+
+    var mem2 = [_]u8{ 0x0F, 0xBA, 0xE8, 0x03 } ++ [_]u8{0} ** 60; // bts eax, 3
+    var s2 = CpuState{ .memory = &mem2, .memory_size = mem2.len };
+    s2.regs[EAX] = 0;
+    cpuStep(&s2);
+    try testing.expectEqual(@as(u32, 8), s2.regs[EAX]);
+    try testing.expectEqual(@as(u32, 4), s2.eip);
+}
+
+test "0F BA /0 (undefined Group 8 encoding) faults as an unknown opcode instead of acting like BT" {
+    var mem = [_]u8{ 0x0F, 0xBA, 0x04, 0x24, 0x05 } ++ [_]u8{0} ** 59;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[ESP] = 32;
+    cpuStep(&s);
+    try testing.expect(s.faulted);
+    try testing.expect(s.unknown_opcode);
+    try testing.expectEqual(@as(u8, 0xBA), s.last_opcode);
+}
+
+test "a missing two-byte (0x0F xx) opcode sets unknown_opcode with the real second byte as last_opcode" {
+    // 0x0F 0xFF is not a real x86 instruction -- confirms two_byte.zig's
+    // own fault path (distinct code from dispatch_table's opFault) was
+    // correctly wired into the same diagnostic, and that last_opcode
+    // reports the actual missing byte (0xFF), not the 0x0F escape prefix
+    // cpuStep's top-level fetch would otherwise leave it as.
+    var mem = [_]u8{ 0x0F, 0xFF } ++ [_]u8{0} ** 62;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    cpuStep(&s);
+    try testing.expect(s.faulted);
+    try testing.expect(s.unknown_opcode);
+    try testing.expectEqual(@as(u8, 0xFF), s.last_opcode);
 }
 
 test "a wired opcode never sets unknown_opcode, even when it itself faults" {

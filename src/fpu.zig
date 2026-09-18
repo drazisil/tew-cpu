@@ -9,6 +9,58 @@ const std = @import("std");
 const core = @import("core.zig");
 const CpuState = core.CpuState;
 
+// ─── x87 float -> integer stores (FIST/FISTP/FISTTP) ─────────────────────────
+// Found live 2026-09-18: a guest FISTP whose source was NaN/Inf/out of range hit
+// `@intFromFloat`, which PANICS the entire host process (Zig safety check) --
+// the emulator itself aborted (SIGABRT, exit 134) instead of the guest seeing
+// anything. Real x87 never traps here: with the invalid-operation exception
+// masked (the state every user-mode program runs in) it stores the "integer
+// indefinite" -- the most negative value of the destination width -- and sets
+// IE in the status word. Also honors the control word's rounding-control bits
+// (default round-to-nearest-EVEN; previously FIST/FISTP m32/m16 rounded
+// half-away-from-zero and FISTP m64 always truncated, ignoring FLDCW).
+const RoundMode = enum { nearest_even, down, up, truncate };
+
+fn roundModeFromCw(cw: u16) RoundMode {
+    return switch ((cw >> 10) & 3) {
+        0 => .nearest_even,
+        1 => .down,
+        2 => .up,
+        else => .truncate,
+    };
+}
+
+fn roundToIntegral(x: f80, mode: RoundMode) f80 {
+    return switch (mode) {
+        .truncate => @trunc(x),
+        .down => @floor(x),
+        .up => @ceil(x),
+        .nearest_even => blk: {
+            const f = @floor(x);
+            const diff = x - f;
+            if (diff < 0.5) break :blk f;
+            if (diff > 0.5) break :blk f + 1;
+            break :blk if (@floor(f / 2.0) * 2.0 == f) f else f + 1; // exact tie: even neighbour
+        },
+    };
+}
+
+fn fistConvert(comptime T: type, s: *CpuState, x: f80, mode: RoundMode) T {
+    const indefinite: T = std.math.minInt(T);
+    if (std.math.isNan(x) or std.math.isInf(x)) {
+        s.fpu_status_word |= 0x0001; // IE
+        return indefinite;
+    }
+    const r = roundToIntegral(x, mode);
+    const lo: f80 = @floatFromInt(std.math.minInt(T));
+    const hi: f80 = @floatFromInt(std.math.maxInt(T));
+    if (r < lo or r > hi) {
+        s.fpu_status_word |= 0x0001; // IE
+        return indefinite;
+    }
+    return @intFromFloat(r);
+}
+
 // ─── FPU stack helpers ────────────────────────────────────────────────────────
 inline fn fpuGet(s: *CpuState, i: u8) f80 {
     return s.fpu_stack[(@as(u8, @truncate(s.fpu_top)) +% i) & 7];
@@ -142,7 +194,12 @@ pub fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
                 2 => fpuSet(s, 0, @sqrt(fpuGet(s, 0))),  // FSQRT
                 3 => { const v = fpuGet(s, 0); fpuSet(s, 0, @sin(v)); fpuPush(s, @cos(v)); },  // FSINCOS
                 4 => fpuSet(s, 0, @round(fpuGet(s, 0))),  // FRNDINT
-                5 => { const sc: i64 = @intFromFloat(@trunc(fpuGet(s, 1))); fpuSet(s, 0, fpuGet(s, 0) * std.math.exp2(@as(f80, @floatFromInt(sc)))); },  // FSCALE
+                5 => { // FSCALE: ST0 *= 2^trunc(ST1). Stays in f80 (no @intFromFloat, which panics the host on NaN/Inf/huge ST1); the clamp only bounds exp2 -- 2^+-20000 already over/underflows f80.
+                    const t = @trunc(fpuGet(s, 1));
+                    const st0 = fpuGet(s, 0);
+                    if (std.math.isNan(t)) fpuSet(s, 0, t)
+                    else if (st0 != 0 and !std.math.isInf(st0)) fpuSet(s, 0, st0 * std.math.exp2(std.math.clamp(t, @as(f80, -20000), @as(f80, 20000))));
+                },
                 6 => fpuSet(s, 0, @sin(fpuGet(s, 0))),  // FSIN
                 7 => fpuSet(s, 0, @cos(fpuGet(s, 0))),  // FCOS
                 else => {},
@@ -200,9 +257,9 @@ pub fn opDB(s: *CpuState) void { // FILD/FISTP int32, FCLEX/FINIT, FUCOMI
         const r = core.resolveRm(s, d.mod, d.rm); const addr = core.applySegOvr(s, r.addr);
         switch (d.reg) {
             0 => fpuPush(s, @floatFromInt(core.memReadS32(s, addr))),  // FILD m32
-            1 => { const i: i32 = @intFromFloat(@trunc(fpuGet(s, 0))); core.memWrite32(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTTP
-            2 => { const i: i32 = @intFromFloat(@round(fpuGet(s, 0))); core.memWrite32(s, addr, @bitCast(i)); },  // FIST
-            3 => { const i: i32 = @intFromFloat(@round(fpuGet(s, 0))); core.memWrite32(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTP
+            1 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), .truncate))); _ = fpuPop(s); },  // FISTTP
+            2 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); },  // FIST
+            3 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); _ = fpuPop(s); },  // FISTP
             5 => { // FLD m80real
                 const lo = core.memRead32(s, addr); const hi = core.memRead32(s, addr + 4); const exp = core.memRead16(s, addr + 8);
                 const sign: f80 = if ((exp & 0x8000) != 0) -1.0 else 1.0;
@@ -306,13 +363,13 @@ pub fn opDF(s: *CpuState) void { // FILD/FISTP int16/int64, FNSTSW AX, FUCOMIP
         const r = core.resolveRm(s, d.mod, d.rm); const addr = core.applySegOvr(s, r.addr);
         switch (d.reg) {
             0 => { const raw = core.memRead16(s, addr); fpuPush(s, @floatFromInt(@as(i16, @bitCast(raw)))); },  // FILD m16
-            1 => { const i: i16 = @intFromFloat(@trunc(fpuGet(s, 0))); core.memWrite16(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTTP m16
-            2 => { const i: i16 = @intFromFloat(@round(fpuGet(s, 0))); core.memWrite16(s, addr, @bitCast(i)); },  // FIST m16
-            3 => { const i: i16 = @intFromFloat(@round(fpuGet(s, 0))); core.memWrite16(s, addr, @bitCast(i)); _ = fpuPop(s); },  // FISTP m16
+            1 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), .truncate))); _ = fpuPop(s); },  // FISTTP m16
+            2 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); },  // FIST m16
+            3 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); _ = fpuPop(s); },  // FISTP m16
             // FILD m64: f80 has 64-bit mantissa — all i64 values are exact, no precision loss.
             5 => { const lo = core.memRead32(s, addr); const hi = core.memReadS32(s, addr + 4); fpuPush(s, @as(f80, @floatFromInt(@as(i64, hi) * @as(i64, 0x100000000) + @as(i64, lo)))); },  // FILD m64
             // FISTP m64: f80→i64 is exact for all representable integers.
-            7 => { const val = fpuGet(s, 0); const iv: i64 = @intFromFloat(@trunc(val)); const bits: u64 = @bitCast(iv); core.memWrite32(s, addr, @truncate(bits)); core.memWrite32(s, addr + 4, @truncate(bits >> 32)); _ = fpuPop(s); },  // FISTP m64
+            7 => { const val = fpuGet(s, 0); const bits: u64 = @bitCast(fistConvert(i64, s, val, roundModeFromCw(s.fpu_control_word))); core.memWrite32(s, addr, @truncate(bits)); core.memWrite32(s, addr + 4, @truncate(bits >> 32)); _ = fpuPop(s); },  // FISTP m64
             else => {},
         }
     }
