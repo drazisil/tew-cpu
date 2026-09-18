@@ -609,6 +609,10 @@ fn opC0(s: *CpuState) void { // Group 2: shift rm8, imm8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
     doGroup2_8(s, res.is_reg, res.addr, d.reg, res.value, fetch8(s) & 0x1F);
 }
+fn opD0(s: *CpuState) void { // Group 2: shift rm8, 1
+    const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
+    doGroup2_8(s, res.is_reg, res.addr, d.reg, res.value, 1);
+}
 fn opD1(s: *CpuState) void { // Group 2: shift rmv, 1 -- see opC1's comment
     const d = decodeModRM(s); const res = readRmvResolved(s, d.mod, d.rm);
     const width: Width = if (s.op_size_ovr) .w16 else .w32;
@@ -818,6 +822,10 @@ fn op25(s: *CpuState) void { // AND EAX/AX, immv -- see op85's comment
     const a = readEaxv(s); const imm = fetchImm(s); const r = a & imm;
     const width: Width = if (s.op_size_ovr) .w16 else .w32;
     updateFlagsLogicW(s, r, width); writeEaxv(s, r);
+}
+fn op34(s: *CpuState) void { // XOR AL, imm8
+    const imm = fetch8(s); const al: u8 = @truncate(s.regs[EAX]);
+    const r = al ^ imm; s.regs[EAX] = (s.regs[EAX] & 0xFFFFFF00) | r; updateFlagsLogicW(s, r, .w8);
 }
 fn op30(s: *CpuState) void { // XOR rm8, r8
     const d = decodeModRM(s); const res = readRm8Resolved(s, d.mod, d.rm);
@@ -1296,7 +1304,7 @@ const dispatch_table: [256]OpFn = dt: {
     t[0x1C] = op1C; t[0x1D] = op1D; t[0x1E] = op1E; t[0x1F] = op1F;
     t[0x20] = op20; t[0x21] = op21; t[0x22] = op22; t[0x23] = op23; t[0x24] = op24; t[0x25] = op25;
     t[0x28] = op28; t[0x29] = op29; t[0x2A] = op2A; t[0x2B] = op2B; t[0x2C] = op2C; t[0x2D] = op2D;
-    t[0x30] = op30; t[0x31] = op31; t[0x32] = op32; t[0x33] = op33; t[0x35] = op35;
+    t[0x30] = op30; t[0x31] = op31; t[0x32] = op32; t[0x33] = op33; t[0x34] = op34; t[0x35] = op35;
     t[0x38] = op38; t[0x39] = op39; t[0x3A] = op3A; t[0x3B] = op3B; t[0x3C] = op3C; t[0x3D] = op3D;
     var r: u8 = 0;
     while (r < 8) : (r += 1) {
@@ -1330,7 +1338,7 @@ const dispatch_table: [256]OpFn = dt: {
     t[0xAA] = opAA; t[0xAB] = opAB; t[0xAC] = opAC; t[0xAD] = opAD; t[0xAE] = opAE; t[0xAF] = opAF;
     t[0xC0] = opC0; t[0xC1] = opC1; t[0xC2] = opC2; t[0xC3] = opC3; t[0xC4] = opC4; t[0xC5] = opC5;
     t[0xC6] = opC6; t[0xC7] = opC7; t[0xC8] = opC8; t[0xC9] = opC9; t[0xCC] = opCC; t[0xCD] = opCD;
-    t[0xD1] = opD1; t[0xD2] = opD2; t[0xD3] = opD3;
+    t[0xD0] = opD0; t[0xD1] = opD1; t[0xD2] = opD2; t[0xD3] = opD3;
     t[0xD8] = fpu.opD8; t[0xD9] = fpu.opD9; t[0xDA] = fpu.opDA; t[0xDB] = fpu.opDB;
     t[0xDC] = fpu.opDC; t[0xDD] = fpu.opDD; t[0xDE] = fpu.opDE; t[0xDF] = fpu.opDF;
     t[0xE0] = opE0; t[0xE1] = opE1; t[0xE2] = opE2; t[0xE3] = opE3;
@@ -1343,6 +1351,7 @@ const dispatch_table: [256]OpFn = dt: {
 
 // ─── Execution engine ─────────────────────────────────────────────────────────
 pub fn cpuStep(s: *CpuState) void {
+    s.last_instr_eip = s.eip;
     var opcode = fetch8(s);
     while (isPrefix(opcode)) {
         switch (opcode) {
@@ -1879,6 +1888,68 @@ test "doGroup2 SAR EAX,1 sets CF to the shifted-out bit" {
     cpuStep(&s);
     try testing.expectEqual(@as(u32, 0x00000001), s.regs[EAX]);
     try testing.expect(getFlag(&s, CF_BIT));
+}
+
+test "opD0: SHR AL,1 (Group 2 shift rm8, 1) sets CF to the shifted-out bit" {
+    // Regression coverage for the missing 0xD0 dispatch-table entry
+    // found live 2026-09-18: t[0xD1]/t[0xD2]/t[0xD3] were wired but 0xD0
+    // (the 8-bit shift-group-1 opcode, e.g. SHR AL,1) was never added,
+    // so it silently fell through to opFault. The resulting halt looked
+    // like a real guest crash one byte later (at the ModRM byte, since
+    // opFault fires after fetch8 has already advanced EIP past the
+    // opcode) and was misdiagnosed as a wild pointer inside DBRES_Login
+    // for a full session before the real cause was found.
+    var mem = [_]u8{0xD0, 0xE8} ++ [_]u8{0} ** 62; // shr al,1
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x00000001;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x00000000), s.regs[EAX] & 0xFF);
+    try testing.expect(getFlag(&s, CF_BIT));
+    try testing.expect(!s.faulted);
+    try testing.expect(!s.unknown_opcode);
+}
+
+test "op34: XOR AL,imm8" {
+    // Regression coverage for the missing 0x34 dispatch-table entry
+    // found live 2026-09-18 during the same opcode-coverage audit that
+    // found 0xD0 -- t[0x33]/t[0x35] were wired with a bare skip over
+    // 0x34 in between, almost certainly a copy-paste gap.
+    var mem = [_]u8{0x34, 0x0F} ++ [_]u8{0} ** 62; // xor al,0x0f
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 0x000000FF;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x000000F0), s.regs[EAX] & 0xFF);
+    try testing.expect(!s.faulted);
+    try testing.expect(!s.unknown_opcode);
+}
+
+test "opFault sets unknown_opcode and last_instr_eip points at the missing opcode, not past it" {
+    // 0xF1 (LOCK's undocumented ICEBP-adjacent slot) is one of the real
+    // remaining dispatch-table gaps -- see the 2026-09-18 opcode-coverage
+    // audit. last_instr_eip must equal the opcode's own address, not
+    // s.eip (which has already advanced past the missing byte by the
+    // time opFault runs) -- that off-by-one was exactly what made the
+    // 0xD0 gap look like a wild jump into 0x0099ed78 instead of a clean
+    // "unknown opcode at 0x0099ed77".
+    var mem = [_]u8{0xF1, 0x90, 0x90} ++ [_]u8{0} ** 61;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len, .eip = 0 };
+    cpuStep(&s);
+    try testing.expect(s.faulted);
+    try testing.expect(s.unknown_opcode);
+    try testing.expectEqual(@as(u32, 0), s.last_instr_eip);
+    try testing.expectEqual(@as(u8, 0xF1), s.last_opcode);
+}
+
+test "a wired opcode never sets unknown_opcode, even when it itself faults" {
+    // Guards against a future regression where unknown_opcode gets set
+    // too broadly (e.g. moved to a shared fault-entry path) and stops
+    // meaning what it says -- it must stay true only for opFault's own
+    // dispatch_table-miss case.
+    var mem = [_]u8{0xD1, 0xE8} ++ [_]u8{0} ** 62; // shr eax,1 -- real, wired opcode
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EAX] = 1;
+    cpuStep(&s);
+    try testing.expect(!s.unknown_opcode);
 }
 
 test "doGroup2 SHL EAX,0xB truncates to 32 bits on a large shift count" {

@@ -151,12 +151,14 @@ pub fn op0F(s: *CpuState) void {
             }
         },
         // ── MMX ──────────────────────────────────────────────────────────────
-        0x6E => mmx.opMovdLoad(s),    // MOVD mm, r/m32
-        0x6F => mmx.opMovqLoad(s),    // MOVQ mm, m64/mm
-        0x7E => mmx.opMovdStore(s),   // MOVD r/m32, mm
-        0x7F => mmx.opMovqStore(s),   // MOVQ m64/mm, mm
-        0x62 => mmx.opPunpckldq(s),   // PUNPCKLDQ mm, mm/m32
-        0x77 => mmx.opEmms(s),        // EMMS
+        // TEMPORARY debug counters (2026-09-03) -- see core.zig's
+        // mmx_call_count/mmx_last_eip comment. Remove once resolved.
+        0x6E => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovdLoad(s); },    // MOVD mm, r/m32
+        0x6F => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovqLoad(s); },    // MOVQ mm, m64/mm
+        0x7E => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovdStore(s); },   // MOVD r/m32, mm
+        0x7F => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovqStore(s); },   // MOVQ m64/mm, mm
+        0x62 => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opPunpckldq(s); },   // PUNPCKLDQ mm, mm/m32
+        0x77 => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opEmms(s); },        // EMMS
         else => { s.faulted = true; s.halted = true; },
     }
 }

@@ -100,7 +100,11 @@ pub fn opD8(s: *CpuState) void { // float32 ops
         const r = core.resolveRm(s, d.mod, d.rm); const addr = core.applySegOvr(s, r.addr);
         const val: f80 = readFloat(s, addr); const st0 = fpuGet(s, 0);
         switch (d.reg) {
-            0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
+            0 => fpuSet(s, 0, st0 + val),
+            // TEMPORARY (2026-09-03): capture real host x87 state (control
+            // word, status word, ST(0)) immediately after the multiply --
+            // see core.zig's captureHostFpuState. Remove once resolved.
+            1 => { const prod = st0 * val; core.captureHostFpuState(s); fpuSet(s, 0, prod); },
             2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
             4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
             6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
