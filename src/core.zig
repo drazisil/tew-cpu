@@ -38,7 +38,7 @@ pub const REP_REPNE: u8 = 2;
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 pub const IntHandlerFn = *const fn (state: *anyopaque, int_num: u8) callconv(.c) void;
-pub const LogpointFn  = *const fn (eip: u32, regs: [*]u32, memory: [*]u8, memory_size: usize) callconv(.c) void;
+pub const LogpointFn = *const fn (eip: u32, regs: [*]u32, memory: [*]u8, memory_size: usize) callconv(.c) void;
 pub const OpFn = *const fn (*CpuState) void;
 // Execution-history capture hooks (ported from pe-walker's vendored copy --
 // see history/capture.zig). Both are pure observation: void-returning, and
@@ -70,6 +70,17 @@ pub const CpuState = struct {
     fpu_tag_word: u16 = 0xFFFF,
     // MMX registers mm0–mm7 (shared silicon with x87, separate storage here).
     mmx_regs: [8]u64 = .{0} ** 8,
+    // TEMPORARY debug counters (2026-09-03, screen.c(475) FMUL-NaN investigation):
+    // real x87/MMX aliasing (mmx_regs sharing physical storage with fpu_stack)
+    // is NOT modeled above -- checking whether any MMX instruction executes at
+    // all near the crash, since game code relying on real aliasing would see
+    // stale fpu_stack data under this separated-storage model. Remove once
+    // that investigation is resolved.
+    mmx_call_count: u32 = 0,
+    mmx_last_eip: u32 = 0,
+    // Test-only regression guard: times the HOST x87 stack was non-empty at an
+    // x87 handler entry (see hostFpuCheck). Stays 0 unless a handler leaks.
+    host_fpu_dirty_count: u32 = 0,
     halted: bool = false,
     faulted: bool = false,
     // Opt-in null-page guard (default off so every existing test's
@@ -107,6 +118,31 @@ pub const CpuState = struct {
     seg_ss: u16 = 0,
     step_count: u64 = 0,
     last_opcode: u8 = 0,
+    // Set only by opFault (dispatch_table miss -- an opcode with no
+    // handler), never by a real memory-access/SEH-worthy fault. Lets the
+    // host distinguish "genuinely unimplemented opcode" from "real guest
+    // fault" instead of both looking like an identical opaque halt -- the
+    // TS original (CPU.ts/Decoder.ts) used to throw a real "Unknown
+    // opcode: 0xXX at EIP=..." error; that diagnostic was lost in the
+    // Zig port until this field restored it.
+    unknown_opcode: bool = false,
+    // Instruction-start EIP (before prefix/opcode bytes are consumed),
+    // captured at the top of every cpuStep -- by the time opFault runs,
+    // s.eip has already advanced past the missing opcode byte, so it no
+    // longer points at the instruction that actually failed to decode.
+    last_instr_eip: u32 = 0,
+    // Observability for x87 FIST/FISTP/FISTTP stores of NaN/Inf/out-of-range
+    // values (which real hardware silently turns into the "integer indefinite"
+    // and which fpu.zig now mirrors instead of panicking the host). Silent on
+    // real hardware, but here it is exactly the signal that upstream float math
+    // produced garbage -- see fpu.zig's fistConvert and TODO.md's screen.c(475)
+    // entry. Zig has no logging; the host polls these via cpu_get_fist_invalid_*.
+    fist_invalid_count: u32 = 0,
+    fist_invalid_eip: u32 = 0,
+    fist_invalid_val: f80 = 0,
+    // Return addresses walked off the EBP chain AT the moment of the store (the
+    // host polls later, by which time the stack has moved on). Zero = chain ended.
+    fist_invalid_ret: [3]u32 = .{ 0, 0, 0 },
     int_handler: ?IntHandlerFn = null,
     memory: [*]u8 = undefined,
     memory_size: usize = 0,
@@ -118,21 +154,37 @@ pub const CpuState = struct {
     watchpoint_val: u32 = 0,
     watchpoint_hit: bool = false,
     // EIP breakpoints (halt): up to 8 slots; 0 = empty.
-    bp_table:   [8]u32 = .{0} ** 8,
-    bp_hit:     bool   = false,
-    bp_hit_eip: u32    = 0,
+    bp_table: [8]u32 = .{0} ** 8,
+    bp_hit: bool = false,
+    bp_hit_eip: u32 = 0,
     // EIP logpoints (fire C callback inline, no halt): up to 8 slots.
-    lp_eip:  [8]u32     = .{0} ** 8,
-    lp_cb:   [8]?LogpointFn = .{null} ** 8,
+    lp_eip: [8]u32 = .{0} ** 8,
+    lp_cb: [8]?LogpointFn = .{null} ** 8,
     // Execution-history capture (ported from pe-walker's vendored copy --
     // see history/capture.zig). run_id is set once, by cpu_create, at
     // CpuState construction time -- the core's own native notion of "a new
     // session" is the birth of a fresh CpuState.
     run_id: u64 = 0,
-    history_ctx: ?*anyopaque = null,   // shared by both hooks below
+    history_ctx: ?*anyopaque = null, // shared by both hooks below
     write_hook: ?WriteHookFn = null,
     step_hook: ?StepHookFn = null,
 };
+
+// Regression guard for the 2026-09 host-x87 stack leak (see fpu.zig's fpuDrop
+// comment): tew's f80 arithmetic runs on the HOST's real x87 unit, and a handler
+// that leaves an entry on it (e.g. by discarding an f80 return value) makes a
+// later host `fld` overflow into a QNaN. Called at the top of every x87 handler
+// but compiled to a no-op outside `zig build test`, so production pays nothing.
+// fxsave (unlike fnstenv) has no side effects; abridged FTW byte 4 is 0 exactly
+// when the host stack is empty.
+pub fn hostFpuCheck(s: *CpuState) void {
+    if (!@import("builtin").is_test) return;
+    var buf: [512]u8 align(16) = undefined;
+    asm volatile ("fxsave %[b]"
+        : [b] "=m" (buf),
+    );
+    if (buf[4] != 0) s.host_fpu_dirty_count +%= 1;
+}
 
 // ─── Internal helper structs ─────────────────────────────────────────────────
 pub const RmInfo = struct { is_reg: bool, addr: u32 };
@@ -153,7 +205,11 @@ fn isFaultingAddr(s: *const CpuState, addr: u32) bool {
 }
 
 pub inline fn memRead8(s: *CpuState, addr: u32) u8 {
-    if (isFaultingAddr(s, addr)) { s.faulted = true; s.halted = true; return 0; }
+    if (isFaultingAddr(s, addr)) {
+        s.faulted = true;
+        s.halted = true;
+        return 0;
+    }
     return primitives.readByte(s.memory, addr);
 }
 pub inline fn memRead16(s: *CpuState, addr: u32) u16 {
@@ -161,11 +217,17 @@ pub inline fn memRead16(s: *CpuState, addr: u32) u16 {
 }
 pub inline fn memRead32(s: *CpuState, addr: u32) u32 {
     return @as(u32, memRead8(s, addr)) | (@as(u32, memRead8(s, addr +% 1)) << 8) |
-           (@as(u32, memRead8(s, addr +% 2)) << 16) | (@as(u32, memRead8(s, addr +% 3)) << 24);
+        (@as(u32, memRead8(s, addr +% 2)) << 16) | (@as(u32, memRead8(s, addr +% 3)) << 24);
 }
-pub inline fn memReadS32(s: *CpuState, addr: u32) i32 { return @bitCast(memRead32(s, addr)); }
+pub inline fn memReadS32(s: *CpuState, addr: u32) i32 {
+    return @bitCast(memRead32(s, addr));
+}
 pub inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
-    if (isFaultingAddr(s, addr)) { s.faulted = true; s.halted = true; return; }
+    if (isFaultingAddr(s, addr)) {
+        s.faulted = true;
+        s.halted = true;
+        return;
+    }
     if (s.watchpoint != 0 and addr == s.watchpoint) {
         s.watchpoint_eip = s.eip;
         s.watchpoint_val = v;
@@ -209,8 +271,12 @@ pub inline fn fetch32(s: *CpuState) u32 {
     s.eip +%= 4;
     return v;
 }
-pub inline fn fetchS8(s: *CpuState) i8 { return @bitCast(fetch8(s)); }
-pub inline fn fetchS32(s: *CpuState) i32 { return @bitCast(fetch32(s)); }
+pub inline fn fetchS8(s: *CpuState) i8 {
+    return @bitCast(fetch8(s));
+}
+pub inline fn fetchS32(s: *CpuState) i32 {
+    return @bitCast(fetch32(s));
+}
 pub inline fn fetchImm(s: *CpuState) u32 {
     return if (s.op_size_ovr) @as(u32, fetch16(s)) else fetch32(s);
 }
@@ -223,7 +289,9 @@ pub inline fn fetchSImm(s: *CpuState) i32 {
 }
 
 // ─── Flag helpers ─────────────────────────────────────────────────────────────
-pub inline fn getFlag(s: *CpuState, bit: u5) bool { return ((s.eflags >> bit) & 1) != 0; }
+pub inline fn getFlag(s: *CpuState, bit: u5) bool {
+    return ((s.eflags >> bit) & 1) != 0;
+}
 pub inline fn setFlag(s: *CpuState, bit: u5, v: bool) void {
     if (v) s.eflags |= @as(u32, 1) << bit else s.eflags &= ~(@as(u32, 1) << bit);
 }
@@ -260,7 +328,9 @@ pub fn updateFlagsArithW(s: *CpuState, result_raw: i64, op1: anytype, op2: anyty
     setFlag(s, ZF_BIT, r == 0);
     setFlag(s, SF_BIT, (r & sign_bit) != 0);
     var p: u8 = @truncate(r);
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+    p ^= p >> 4;
+    p ^= p >> 2;
+    p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
     // CF must come from result_raw (the full-precision, un-truncated delta
     // every caller already computes correctly), not from re-deriving it via
@@ -311,7 +381,9 @@ pub fn updateFlagsShiftW(s: *CpuState, result: anytype, width: Width) void {
     setFlag(s, ZF_BIT, r == 0);
     setFlag(s, SF_BIT, (r & widthSignBit(width)) != 0);
     var p: u8 = @truncate(r);
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+    p ^= p >> 4;
+    p ^= p >> 2;
+    p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
 }
 
@@ -322,7 +394,9 @@ pub fn updateFlagsLogicW(s: *CpuState, result: anytype, width: Width) void {
     setFlag(s, CF_BIT, false);
     setFlag(s, OF_BIT, false);
     var p: u8 = @truncate(r);
-    p ^= p >> 4; p ^= p >> 2; p ^= p >> 1;
+    p ^= p >> 4;
+    p ^= p >> 2;
+    p ^= p >> 1;
     setFlag(s, PF_BIT, (p & 1) == 0);
 }
 
@@ -454,8 +528,7 @@ pub fn readRmv(s: *CpuState, mod: u8, rm: u8) u32 {
 pub fn writeRmv(s: *CpuState, mod: u8, rm: u8, v: u32) void {
     const r = resolveRm(s, mod, rm);
     if (r.is_reg) {
-        if (s.op_size_ovr) s.regs[r.addr] = (s.regs[r.addr] & 0xFFFF0000) | (v & 0xFFFF)
-        else s.regs[r.addr] = v;
+        if (s.op_size_ovr) s.regs[r.addr] = (s.regs[r.addr] & 0xFFFF0000) | (v & 0xFFFF) else s.regs[r.addr] = v;
     } else {
         const addr = applySegOvr(s, r.addr);
         if (s.op_size_ovr) memWrite16(s, addr, @truncate(v)) else memWrite32(s, addr, v);
@@ -472,8 +545,7 @@ pub fn readRmvResolved(s: *CpuState, mod: u8, rm: u8) Rm32Result {
 }
 pub fn writeRmvResolved(s: *CpuState, is_reg: bool, addr: u32, v: u32) void {
     if (is_reg) {
-        if (s.op_size_ovr) s.regs[addr] = (s.regs[addr] & 0xFFFF0000) | (v & 0xFFFF)
-        else s.regs[addr] = v;
+        if (s.op_size_ovr) s.regs[addr] = (s.regs[addr] & 0xFFFF0000) | (v & 0xFFFF) else s.regs[addr] = v;
     } else {
         if (s.op_size_ovr) memWrite16(s, addr, @truncate(v)) else memWrite32(s, addr, v);
     }
@@ -482,23 +554,40 @@ pub inline fn readEaxv(s: *CpuState) u32 {
     return if (s.op_size_ovr) s.regs[EAX] & 0xFFFF else s.regs[EAX];
 }
 pub inline fn writeEaxv(s: *CpuState, v: u32) void {
-    if (s.op_size_ovr) s.regs[EAX] = (s.regs[EAX] & 0xFFFF0000) | (v & 0xFFFF)
-    else s.regs[EAX] = v;
+    if (s.op_size_ovr) s.regs[EAX] = (s.regs[EAX] & 0xFFFF0000) | (v & 0xFFFF) else s.regs[EAX] = v;
 }
 
 // ─── Condition evaluation ─────────────────────────────────────────────────────
 pub fn evalCond(s: *CpuState, cond: u8) bool {
-    const cf = getFlag(s, CF_BIT); const zf = getFlag(s, ZF_BIT);
-    const sf = getFlag(s, SF_BIT); const of = getFlag(s, OF_BIT);
+    const cf = getFlag(s, CF_BIT);
+    const zf = getFlag(s, ZF_BIT);
+    const sf = getFlag(s, SF_BIT);
+    const of = getFlag(s, OF_BIT);
     const pf = getFlag(s, PF_BIT);
     return switch (cond & 0xF) {
-        0x0 => of, 0x1 => !of, 0x2 => cf, 0x3 => !cf,
-        0x4 => zf, 0x5 => !zf, 0x6 => cf or zf, 0x7 => !cf and !zf,
-        0x8 => sf, 0x9 => !sf, 0xA => pf, 0xB => !pf,
-        0xC => sf != of, 0xD => sf == of, 0xE => zf or (sf != of),
-        0xF => !zf and (sf == of), else => false,
+        0x0 => of,
+        0x1 => !of,
+        0x2 => cf,
+        0x3 => !cf,
+        0x4 => zf,
+        0x5 => !zf,
+        0x6 => cf or zf,
+        0x7 => !cf and !zf,
+        0x8 => sf,
+        0x9 => !sf,
+        0xA => pf,
+        0xB => !pf,
+        0xC => sf != of,
+        0xD => sf == of,
+        0xE => zf or (sf != of),
+        0xF => !zf and (sf == of),
+        else => false,
     };
 }
 
 // ─── Fault handler ────────────────────────────────────────────────────────────
-pub fn opFault(s: *CpuState) void { s.faulted = true; s.halted = true; }
+pub fn opFault(s: *CpuState) void {
+    s.faulted = true;
+    s.halted = true;
+    s.unknown_opcode = true;
+}

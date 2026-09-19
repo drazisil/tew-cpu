@@ -134,6 +134,7 @@ export fn cpu_clear_halted(s: *CpuState) void {
     if (s.fatal_halted) return;
     s.halted = false;
     s.faulted = false;
+    s.unknown_opcode = false;
 }
 // Fatal halt: the emulator (not real x86) hit something it cannot simulate.
 // Permanent -- no clear function exists on purpose. Reuses the real halt
@@ -156,6 +157,12 @@ export fn cpu_enable_null_page_guard(s: *CpuState) void {
 export fn cpu_get_step_count(s: *CpuState) u64 { return s.step_count; }
 export fn cpu_get_run_id(s: *CpuState) u64 { return s.run_id; }
 export fn cpu_get_last_opcode(s: *CpuState) u8 { return s.last_opcode; }
+export fn cpu_is_unknown_opcode(s: *CpuState) bool { return s.unknown_opcode; }
+export fn cpu_get_last_instr_eip(s: *CpuState) u32 { return s.last_instr_eip; }
+export fn cpu_get_fist_invalid_count(s: *CpuState) u32 { return s.fist_invalid_count; }
+export fn cpu_get_fist_invalid_eip(s: *CpuState) u32 { return s.fist_invalid_eip; }
+export fn cpu_get_fist_invalid_val(s: *CpuState) f64 { return @floatCast(s.fist_invalid_val); }
+export fn cpu_get_fist_invalid_ret(s: *CpuState, idx: u32) u32 { return if (idx < 3) s.fist_invalid_ret[idx] else 0; }
 export fn cpu_set_fs_base(s: *CpuState, val: u32) void { s.fs_base = val; }
 export fn cpu_set_gs_base(s: *CpuState, val: u32) void { s.gs_base = val; }
 export fn cpu_get_fs_base(s: *CpuState) u32 { return s.fs_base; }
@@ -167,6 +174,10 @@ export fn cpu_fpu_set(s: *CpuState, i: u32, val: f64) void {
     if (i < 8) s.fpu_stack[i] = @floatCast(val);
 }
 export fn cpu_fpu_get_top(s: *CpuState) u32 { return s.fpu_top; }
+// TEMPORARY debug getters (2026-09-03) -- see core.zig's mmx_call_count/
+// mmx_last_eip comment. Remove once resolved.
+export fn cpu_get_mmx_call_count(s: *CpuState) u32 { return s.mmx_call_count; }
+export fn cpu_get_mmx_last_eip(s: *CpuState) u32 { return s.mmx_last_eip; }
 export fn cpu_fpu_set_top(s: *CpuState, val: u32) void {
     if (s.fatal_halted) return;
     s.fpu_top = val & 7;

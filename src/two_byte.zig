@@ -11,6 +11,96 @@ const EAX = core.EAX; const ECX = core.ECX; const EDX = core.EDX; const EBX = co
 const ESP = core.ESP;
 const CF_BIT = core.CF_BIT; const ZF_BIT = core.ZF_BIT; const OF_BIT = core.OF_BIT;
 
+// ─── BT/BTS/BTR/BTC rm32, r32 (0F A3/AB/B3/BB) ───────────────────────────────
+// Two things the previous per-opcode copies got wrong (found live 2026-09-18
+// via a `0F AB 04 24` in the game's static CRT, a strspn-style 256-bit
+// char-set bitmap built on the stack with `bts [esp], eax`):
+//  1. The operand must be resolved exactly ONCE. readRmFixed32 + writeRmFixed32
+//     each call resolveRm, so a memory operand's SIB/displacement bytes were
+//     fetched twice -- consuming the next instruction's opcode byte as a
+//     phantom SIB and faulting one byte into the following instruction.
+//  2. With a MEMORY operand the register bit offset is NOT taken mod 32: it
+//     addresses the dword at base + 4*(offset >> 5) (arithmetic shift, so a
+//     negative offset reaches below base) and the bit is offset & 31. Only the
+//     register-destination form (and the imm8 Group 8 form) wraps mod 32.
+const BitOp = enum { bt, bts, btr, btc };
+
+fn bitTestReg(s: *CpuState, comptime op: BitOp) void {
+    const d = core.decodeModRM(s);
+    const offset: u32 = s.regs[d.reg];
+    const bit: u5 = @truncate(offset & 0x1F);
+    const mask: u32 = @as(u32, 1) << bit;
+    const r = core.resolveRm(s, d.mod, d.rm);
+    if (r.is_reg) {
+        const v = s.regs[r.addr];
+        core.setFlag(s, CF_BIT, (v & mask) != 0);
+        switch (op) {
+            .bt => {},
+            .bts => s.regs[r.addr] = v | mask,
+            .btr => s.regs[r.addr] = v & ~mask,
+            .btc => s.regs[r.addr] = v ^ mask,
+        }
+        return;
+    }
+    const signed_offset: i32 = @bitCast(offset);
+    const dword_delta: u32 = @bitCast((signed_offset >> 5) *% 4);
+    const addr = core.applySegOvr(s, r.addr) +% dword_delta;
+    const v = core.memRead32(s, addr);
+    core.setFlag(s, CF_BIT, (v & mask) != 0);
+    switch (op) {
+        .bt => {},
+        .bts => core.memWrite32(s, addr, v | mask),
+        .btr => core.memWrite32(s, addr, v & ~mask),
+        .btc => core.memWrite32(s, addr, v ^ mask),
+    }
+}
+
+// Group 8: 0F BA /4../7 ib. Same single-resolve rule as bitTestReg, plus the
+// encoding order matters: for a memory operand the SIB/displacement bytes
+// come BEFORE the imm8, so the operand must be resolved first and the imm8
+// fetched last (the previous code fetched the imm8 first and would have read
+// the SIB byte as the bit offset). The imm8 form always wraps mod 32 within
+// the addressed dword -- unlike the register-offset form there is no
+// dword displacement. /0../3 are undefined encodings: fault loudly rather
+// than silently acting like BT.
+fn bitTestImm(s: *CpuState, op2: u8) void {
+    const d = core.decodeModRM(s);
+    const kind: BitOp = switch (d.reg) {
+        4 => .bt,
+        5 => .bts,
+        6 => .btr,
+        7 => .btc,
+        else => {
+            s.last_opcode = op2;
+            core.opFault(s);
+            return;
+        },
+    };
+    const r = core.resolveRm(s, d.mod, d.rm);
+    const bit: u5 = @truncate(core.fetch8(s) & 0x1F);
+    const mask: u32 = @as(u32, 1) << bit;
+    if (r.is_reg) {
+        const v = s.regs[r.addr];
+        core.setFlag(s, CF_BIT, (v & mask) != 0);
+        switch (kind) {
+            .bt => {},
+            .bts => s.regs[r.addr] = v | mask,
+            .btr => s.regs[r.addr] = v & ~mask,
+            .btc => s.regs[r.addr] = v ^ mask,
+        }
+        return;
+    }
+    const addr = core.applySegOvr(s, r.addr);
+    const v = core.memRead32(s, addr);
+    core.setFlag(s, CF_BIT, (v & mask) != 0);
+    switch (kind) {
+        .bt => {},
+        .bts => core.memWrite32(s, addr, v | mask),
+        .btr => core.memWrite32(s, addr, v & ~mask),
+        .btc => core.memWrite32(s, addr, v ^ mask),
+    }
+}
+
 // ─── op0F: dispatcher for 0x0F-prefixed opcodes ──────────────────────────────
 pub fn op0F(s: *CpuState) void {
     const op2 = core.fetch8(s);
@@ -120,20 +210,11 @@ pub fn op0F(s: *CpuState) void {
             const r: u8 = op2 & 7; const v = s.regs[r];
             s.regs[r] = ((v & 0xFF) << 24) | (((v >> 8) & 0xFF) << 16) | (((v >> 16) & 0xFF) << 8) | (v >> 24);
         },
-        0xA3 => { // BT rm32, r32
-            const d = core.decodeModRM(s); const bit: u5 = @truncate(s.regs[d.reg] & 0x1F);
-            core.setFlag(s, CF_BIT, ((core.readRmFixed32(s, d.mod, d.rm) >> bit) & 1) != 0);
-        },
-        0xBA => { // Group 8: BT/BTS/BTR/BTC rm32, imm8
-            const d = core.decodeModRM(s); const bit: u5 = @truncate(core.fetch8(s) & 0x1F);
-            const v = core.readRmFixed32(s, d.mod, d.rm); core.setFlag(s, CF_BIT, ((v >> bit) & 1) != 0);
-            switch (d.reg) {
-                5 => core.writeRmFixed32(s, d.mod, d.rm, v | (@as(u32, 1) << bit)),
-                6 => core.writeRmFixed32(s, d.mod, d.rm, v & ~(@as(u32, 1) << bit)),
-                7 => core.writeRmFixed32(s, d.mod, d.rm, (v ^ (@as(u32, 1) << bit))),
-                else => {},
-            }
-        },
+        0xA3 => bitTestReg(s, .bt),  // BT  rm32, r32
+        0xAB => bitTestReg(s, .bts), // BTS rm32, r32
+        0xB3 => bitTestReg(s, .btr), // BTR rm32, r32
+        0xBB => bitTestReg(s, .btc), // BTC rm32, r32
+        0xBA => bitTestImm(s, op2), // Group 8: BT/BTS/BTR/BTC rm32, imm8
         0x34 => { // SYSENTER — fast NT syscall gate
             if (s.int_handler) |h| h(s, 0x2E);
         },
@@ -151,13 +232,27 @@ pub fn op0F(s: *CpuState) void {
             }
         },
         // ── MMX ──────────────────────────────────────────────────────────────
-        0x6E => mmx.opMovdLoad(s),    // MOVD mm, r/m32
-        0x6F => mmx.opMovqLoad(s),    // MOVQ mm, m64/mm
-        0x7E => mmx.opMovdStore(s),   // MOVD r/m32, mm
-        0x7F => mmx.opMovqStore(s),   // MOVQ m64/mm, mm
-        0x62 => mmx.opPunpckldq(s),   // PUNPCKLDQ mm, mm/m32
-        0x77 => mmx.opEmms(s),        // EMMS
-        else => { s.faulted = true; s.halted = true; },
+        // TEMPORARY debug counters (2026-09-03) -- see core.zig's
+        // mmx_call_count/mmx_last_eip comment. Remove once resolved.
+        0x6E => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovdLoad(s); },    // MOVD mm, r/m32
+        0x6F => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovqLoad(s); },    // MOVQ mm, m64/mm
+        0x7E => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovdStore(s); },   // MOVD r/m32, mm
+        0x7F => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opMovqStore(s); },   // MOVQ m64/mm, mm
+        0x62 => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opPunpckldq(s); },   // PUNPCKLDQ mm, mm/m32
+        0x77 => { s.mmx_call_count += 1; s.mmx_last_eip = s.eip; mmx.opEmms(s); },        // EMMS
+        else => {
+            // Reuse the shared opFault path (unknown_opcode diagnostic,
+            // 2026-09-18) so a missing two-byte (0x0F xx) opcode reports
+            // cleanly too, not just a missing single-byte one. last_opcode
+            // is overwritten with the real second byte here -- cpuStep
+            // already set it to 0x0F, which alone wouldn't say which
+            // 0x0F-prefixed instruction was actually missing (found live:
+            // BTS/BTR/BTC rm32,r32 -- 0x0F 0xAB/0xB3/0xBB -- were all
+            // missing here despite BT and the Group 8 imm8 form both
+            // being wired).
+            s.last_opcode = op2;
+            core.opFault(s);
+        },
     }
 }
 
