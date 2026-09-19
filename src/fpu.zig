@@ -45,17 +45,36 @@ fn roundToIntegral(x: f80, mode: RoundMode) f80 {
     };
 }
 
+fn noteFistInvalid(s: *CpuState, x: f80) void {
+    s.fpu_status_word |= 0x0001; // IE
+    s.fist_invalid_count +%= 1;
+    s.fist_invalid_eip = s.last_instr_eip;
+    s.fist_invalid_val = x;
+    // Snapshot up to three caller return addresses via the guest's EBP chain.
+    // Raw, bounds-checked reads only: this runs inside an instruction handler and
+    // must never fault or panic on a garbage EBP.
+    s.fist_invalid_ret = .{ 0, 0, 0 };
+    var ebp: u32 = s.regs[core.EBP];
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        if (ebp == 0 or @as(u64, ebp) + 8 > s.memory_size) break;
+        const e: usize = ebp;
+        s.fist_invalid_ret[i] = std.mem.readInt(u32, s.memory[e + 4 ..][0..4], .little);
+        ebp = std.mem.readInt(u32, s.memory[e ..][0..4], .little);
+    }
+}
+
 fn fistConvert(comptime T: type, s: *CpuState, x: f80, mode: RoundMode) T {
     const indefinite: T = std.math.minInt(T);
     if (std.math.isNan(x) or std.math.isInf(x)) {
-        s.fpu_status_word |= 0x0001; // IE
+        noteFistInvalid(s, x);
         return indefinite;
     }
     const r = roundToIntegral(x, mode);
     const lo: f80 = @floatFromInt(std.math.minInt(T));
     const hi: f80 = @floatFromInt(std.math.maxInt(T));
     if (r < lo or r > hi) {
-        s.fpu_status_word |= 0x0001; // IE
+        noteFistInvalid(s, x);
         return indefinite;
     }
     return @intFromFloat(r);
@@ -77,13 +96,19 @@ fn fpuPush(s: *CpuState, v: f80) void {
     s.fpu_status_word = (s.fpu_status_word & ~@as(u16, 0x3800)) |
                         @as(u16, @truncate((s.fpu_top & 7) << 11));
 }
-fn fpuPop(s: *CpuState) f80 {
-    const v = s.fpu_stack[s.fpu_top & 7];
+// Pop the emulated FPU stack. Deliberately returns void: this used to be
+// `fn fpuPop(s) f80` called as `_ = fpuPop(s);`, and on x86/x86-64 an f80 return
+// value lives in ST(0) of the HOST x87 stack -- Zig does not pop a DISCARDED x87
+// return, so every popping handler (FSTP/FISTP/FCOMP/FADDP/...) leaked one host
+// x87 entry. After 8 leaks the next host `fld` overflows the stack into a QNaN:
+// the 2026-09 "FMUL returns NaN on one call in many" / screen.c(475) mystery.
+// Never write `_ = <f80-returning fn>()` in this file; if a popped value is ever
+// needed, read it with fpuGet(s, 0) BEFORE calling fpuDrop.
+fn fpuDrop(s: *CpuState) void {
     s.fpu_tag_word |= @as(u16, 3) << (@as(u4, @truncate(s.fpu_top & 7)) * 2);
     s.fpu_top = (s.fpu_top +% 1) & 7;
     s.fpu_status_word = (s.fpu_status_word & ~@as(u16, 0x3800)) |
                         @as(u16, @truncate((s.fpu_top & 7) << 11));
-    return v;
 }
 fn fpuSetCC(s: *CpuState, c3: bool, c2: bool, c0: bool) void {
     s.fpu_status_word &= ~@as(u16, 0x4500);
@@ -113,7 +138,7 @@ fn fpuComi(s: *CpuState, a: f80, b: f80, do_pop: bool) void {
         core.setFlag(s, core.ZF_BIT, true); core.setFlag(s, core.CF_BIT, false);
     }
     core.setFlag(s, core.OF_BIT, false);
-    if (do_pop) _ = fpuPop(s);
+    if (do_pop) fpuDrop(s);
 }
 
 // ─── Float memory I/O ─────────────────────────────────────────────────────────
@@ -138,12 +163,13 @@ const FPU_CONSTS = [7]f80{ 1.0, 3.3219280948873626, 1.4426950408889634,
 // ─── FPU opcode handlers ──────────────────────────────────────────────────────
 
 pub fn opD8(s: *CpuState) void { // float32 ops
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         const st0 = fpuGet(s, 0); const sti = fpuGet(s, d.rm);
         switch (d.reg) {
             0 => fpuSet(s, 0, st0 + sti), 1 => fpuSet(s, 0, st0 * sti),
-            2 => fpuCompare(s, st0, sti), 3 => { fpuCompare(s, st0, sti); _ = fpuPop(s); },
+            2 => fpuCompare(s, st0, sti), 3 => { fpuCompare(s, st0, sti); fpuDrop(s); },
             4 => fpuSet(s, 0, st0 - sti), 5 => fpuSet(s, 0, sti - st0),
             6 => fpuSet(s, 0, st0 / sti), 7 => fpuSet(s, 0, sti / st0),
             else => {},
@@ -153,11 +179,13 @@ pub fn opD8(s: *CpuState) void { // float32 ops
         const val: f80 = readFloat(s, addr); const st0 = fpuGet(s, 0);
         switch (d.reg) {
             0 => fpuSet(s, 0, st0 + val),
-            // TEMPORARY (2026-09-03): capture real host x87 state (control
-            // word, status word, ST(0)) immediately after the multiply --
-            // see core.zig's captureHostFpuState. Remove once resolved.
-            1 => { const prod = st0 * val; core.captureHostFpuState(s); fpuSet(s, 0, prod); },
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
+            // The 2026-09-03 captureHostFpuState debug hook that used to run here
+            // (inline-asm fstpt on the HOST x87 stack, every FMUL m32) was removed
+            // 2026-09-18: it popped an empty host stack (its own earlier analysis
+            // said so) and sat inside the very instruction that intermittently
+            // returned NaN -- suspected of causing, not observing, the NaN.
+            1 => fpuSet(s, 0, st0 * val),
+            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); fpuDrop(s); },
             4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
             6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
             else => {},
@@ -166,13 +194,14 @@ pub fn opD8(s: *CpuState) void { // float32 ops
 }
 
 pub fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         switch (d.reg) {
             0 => fpuPush(s, fpuGet(s, d.rm)),  // FLD ST(i)
             1 => { const t = fpuGet(s, 0); fpuSet(s, 0, fpuGet(s, d.rm)); fpuSet(s, d.rm, t); },  // FXCH
             2 => {},  // FNOP
-            3 => { fpuSet(s, d.rm, fpuGet(s, 0)); _ = fpuPop(s); },  // FSTP ST(i)
+            3 => { fpuSet(s, d.rm, fpuGet(s, 0)); fpuDrop(s); },  // FSTP ST(i)
             4 => switch (d.rm) {
                 0 => fpuSet(s, 0, -fpuGet(s, 0)),  // FCHS
                 1 => fpuSet(s, 0, @abs(fpuGet(s, 0))),  // FABS
@@ -183,7 +212,7 @@ pub fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
             5 => if (d.rm < 7) fpuPush(s, FPU_CONSTS[d.rm]),  // FLD constants
             6 => switch (d.rm) {
                 0 => fpuSet(s, 0, std.math.exp2(fpuGet(s, 0)) - 1.0),  // F2XM1
-                1 => { const x = fpuGet(s, 0); const y = fpuGet(s, 1); _ = fpuPop(s); fpuSet(s, 0, y * std.math.log2(x)); },  // FYL2X
+                1 => { const x = fpuGet(s, 0); const y = fpuGet(s, 1); fpuDrop(s); fpuSet(s, 0, y * std.math.log2(x)); },  // FYL2X
                 5 => { fpuSet(s, 0, @rem(fpuGet(s, 0), fpuGet(s, 1))); s.fpu_status_word &= ~@as(u16, 0x0400); },  // FPREM1
                 6 => { s.fpu_top = (s.fpu_top -% 1) & 7; s.fpu_status_word = (s.fpu_status_word & ~@as(u16,0x3800)) | @as(u16, @truncate((s.fpu_top & 7) << 11)); },  // FDECSTP
                 7 => { s.fpu_top = (s.fpu_top +% 1) & 7; s.fpu_status_word = (s.fpu_status_word & ~@as(u16,0x3800)) | @as(u16, @truncate((s.fpu_top & 7) << 11)); },  // FINCSTP
@@ -211,7 +240,7 @@ pub fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
         switch (d.reg) {
             0 => fpuPush(s, readFloat(s, addr)),  // FLD m32
             2 => writeFloat(s, addr, @floatCast(fpuGet(s, 0))),  // FST m32
-            3 => { writeFloat(s, addr, @floatCast(fpuGet(s, 0))); _ = fpuPop(s); },  // FSTP m32
+            3 => { writeFloat(s, addr, @floatCast(fpuGet(s, 0))); fpuDrop(s); },  // FSTP m32
             4 => {},  // FLDENV NOP
             5 => s.fpu_control_word = core.memRead16(s, addr),  // FLDCW
             6 => {},  // FNSTENV NOP
@@ -222,6 +251,7 @@ pub fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
 }
 
 pub fn opDA(s: *CpuState) void { // int32 ops / FCMOV
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         switch (d.reg) {
@@ -229,7 +259,7 @@ pub fn opDA(s: *CpuState) void { // int32 ops / FCMOV
             1 => { if (core.getFlag(s, core.ZF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVE
             2 => { if (core.getFlag(s, core.CF_BIT) or core.getFlag(s, core.ZF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVBE
             3 => fpuSet(s, 0, fpuGet(s, d.rm)),  // FCMOVU
-            5 => if (d.rm == 1) { fpuCompare(s, fpuGet(s, 0), fpuGet(s, 1)); _ = fpuPop(s); _ = fpuPop(s); },  // FUCOMPP
+            5 => if (d.rm == 1) { fpuCompare(s, fpuGet(s, 0), fpuGet(s, 1)); fpuDrop(s); fpuDrop(s); },  // FUCOMPP
             else => {},
         }
     } else {
@@ -237,7 +267,7 @@ pub fn opDA(s: *CpuState) void { // int32 ops / FCMOV
         const val: f80 = @floatFromInt(core.memReadS32(s, addr)); const st0 = fpuGet(s, 0);
         switch (d.reg) {
             0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
+            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); fpuDrop(s); },
             4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
             6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
             else => {},
@@ -246,6 +276,7 @@ pub fn opDA(s: *CpuState) void { // int32 ops / FCMOV
 }
 
 pub fn opDB(s: *CpuState) void { // FILD/FISTP int32, FCLEX/FINIT, FUCOMI
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         if (d.reg == 4) {
@@ -257,9 +288,9 @@ pub fn opDB(s: *CpuState) void { // FILD/FISTP int32, FCLEX/FINIT, FUCOMI
         const r = core.resolveRm(s, d.mod, d.rm); const addr = core.applySegOvr(s, r.addr);
         switch (d.reg) {
             0 => fpuPush(s, @floatFromInt(core.memReadS32(s, addr))),  // FILD m32
-            1 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), .truncate))); _ = fpuPop(s); },  // FISTTP
+            1 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), .truncate))); fpuDrop(s); },  // FISTTP
             2 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); },  // FIST
-            3 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); _ = fpuPop(s); },  // FISTP
+            3 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); fpuDrop(s); },  // FISTP
             5 => { // FLD m80real
                 const lo = core.memRead32(s, addr); const hi = core.memRead32(s, addr + 4); const exp = core.memRead16(s, addr + 8);
                 const sign: f80 = if ((exp & 0x8000) != 0) -1.0 else 1.0;
@@ -268,19 +299,20 @@ pub fn opDB(s: *CpuState) void { // FILD/FISTP int32, FCLEX/FINIT, FUCOMI
                 if (e == -16383 and lo == 0 and hi == 0) fpuPush(s, sign * 0.0)
                 else fpuPush(s, sign * @as(f80, @floatCast(std.math.pow(f64, 2.0, @as(f64, @floatFromInt(e))))) * mant);
             },
-            7 => { writeDouble(s, addr, @floatCast(fpuGet(s, 0))); core.memWrite16(s, addr + 8, 0); _ = fpuPop(s); },  // FSTP m80
+            7 => { writeDouble(s, addr, @floatCast(fpuGet(s, 0))); core.memWrite16(s, addr + 8, 0); fpuDrop(s); },  // FSTP m80
             else => {},
         }
     }
 }
 
 pub fn opDC(s: *CpuState) void { // float64 ops (reversed operands)
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         const st0 = fpuGet(s, 0); const sti = fpuGet(s, d.rm);
         switch (d.reg) {
             0 => fpuSet(s, d.rm, sti + st0), 1 => fpuSet(s, d.rm, sti * st0),
-            2 => fpuCompare(s, st0, sti), 3 => { fpuCompare(s, st0, sti); _ = fpuPop(s); },
+            2 => fpuCompare(s, st0, sti), 3 => { fpuCompare(s, st0, sti); fpuDrop(s); },
             4 => fpuSet(s, d.rm, sti - st0), 5 => fpuSet(s, d.rm, st0 - sti),
             6 => fpuSet(s, d.rm, sti / st0), 7 => fpuSet(s, d.rm, st0 / sti),
             else => {},
@@ -290,7 +322,7 @@ pub fn opDC(s: *CpuState) void { // float64 ops (reversed operands)
         const val: f80 = @floatCast(readDouble(s, addr)); const st0 = fpuGet(s, 0);
         switch (d.reg) {
             0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
+            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); fpuDrop(s); },
             4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
             6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
             else => {},
@@ -299,23 +331,24 @@ pub fn opDC(s: *CpuState) void { // float64 ops (reversed operands)
 }
 
 pub fn opDD(s: *CpuState) void { // FLD/FST/FSTP float64, FUCOM
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         switch (d.reg) {
             0 => { const idx = ((@as(u8, @truncate(s.fpu_top)) +% d.rm) & 7); s.fpu_tag_word |= @as(u16, 3) << (@as(u4, @truncate(idx)) * 2); },  // FFREE
             2 => fpuSet(s, d.rm, fpuGet(s, 0)),  // FST
-            3 => { fpuSet(s, d.rm, fpuGet(s, 0)); _ = fpuPop(s); },  // FSTP
+            3 => { fpuSet(s, d.rm, fpuGet(s, 0)); fpuDrop(s); },  // FSTP
             4 => fpuCompare(s, fpuGet(s, 0), fpuGet(s, d.rm)),  // FUCOM
-            5 => { fpuCompare(s, fpuGet(s, 0), fpuGet(s, d.rm)); _ = fpuPop(s); },  // FUCOMP
+            5 => { fpuCompare(s, fpuGet(s, 0), fpuGet(s, d.rm)); fpuDrop(s); },  // FUCOMP
             else => {},
         }
     } else {
         const r = core.resolveRm(s, d.mod, d.rm); const addr = core.applySegOvr(s, r.addr);
         switch (d.reg) {
             0 => fpuPush(s, @floatCast(readDouble(s, addr))),  // FLD m64
-            1 => { writeDouble(s, addr, @floatCast(@trunc(fpuGet(s, 0)))); _ = fpuPop(s); },  // FISTTP m64
+            1 => { writeDouble(s, addr, @floatCast(@trunc(fpuGet(s, 0)))); fpuDrop(s); },  // FISTTP m64
             2 => writeDouble(s, addr, @floatCast(fpuGet(s, 0))),  // FST m64
-            3 => { writeDouble(s, addr, @floatCast(fpuGet(s, 0))); _ = fpuPop(s); },  // FSTP m64
+            3 => { writeDouble(s, addr, @floatCast(fpuGet(s, 0))); fpuDrop(s); },  // FSTP m64
             4, 6 => {},  // FRSTOR/FNSAVE NOP
             7 => core.memWrite16(s, addr, s.fpu_status_word),  // FNSTSW m16
             else => {},
@@ -324,18 +357,19 @@ pub fn opDD(s: *CpuState) void { // FLD/FST/FSTP float64, FUCOM
 }
 
 pub fn opDE(s: *CpuState) void { // FADDP/FMULP/etc / int16
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         const st0 = fpuGet(s, 0); const sti = fpuGet(s, d.rm);
         switch (d.reg) {
-            0 => { fpuSet(s, d.rm, sti + st0); _ = fpuPop(s); },  // FADDP
-            1 => { fpuSet(s, d.rm, sti * st0); _ = fpuPop(s); },  // FMULP
-            2 => { fpuCompare(s, st0, sti); _ = fpuPop(s); },
-            3 => if (d.rm == 1) { fpuCompare(s, st0, fpuGet(s, 1)); _ = fpuPop(s); _ = fpuPop(s); },  // FCOMPP
-            4 => { fpuSet(s, d.rm, st0 - sti); _ = fpuPop(s); },  // FSUBRP
-            5 => { fpuSet(s, d.rm, sti - st0); _ = fpuPop(s); },  // FSUBP
-            6 => { fpuSet(s, d.rm, st0 / sti); _ = fpuPop(s); },  // FDIVRP
-            7 => { fpuSet(s, d.rm, sti / st0); _ = fpuPop(s); },  // FDIVP
+            0 => { fpuSet(s, d.rm, sti + st0); fpuDrop(s); },  // FADDP
+            1 => { fpuSet(s, d.rm, sti * st0); fpuDrop(s); },  // FMULP
+            2 => { fpuCompare(s, st0, sti); fpuDrop(s); },
+            3 => if (d.rm == 1) { fpuCompare(s, st0, fpuGet(s, 1)); fpuDrop(s); fpuDrop(s); },  // FCOMPP
+            4 => { fpuSet(s, d.rm, st0 - sti); fpuDrop(s); },  // FSUBRP
+            5 => { fpuSet(s, d.rm, sti - st0); fpuDrop(s); },  // FSUBP
+            6 => { fpuSet(s, d.rm, st0 / sti); fpuDrop(s); },  // FDIVRP
+            7 => { fpuSet(s, d.rm, sti / st0); fpuDrop(s); },  // FDIVP
             else => {},
         }
     } else {
@@ -344,7 +378,7 @@ pub fn opDE(s: *CpuState) void { // FADDP/FMULP/etc / int16
         const st0 = fpuGet(s, 0);
         switch (d.reg) {
             0 => fpuSet(s, 0, st0 + val), 1 => fpuSet(s, 0, st0 * val),
-            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); _ = fpuPop(s); },
+            2 => fpuCompare(s, st0, val), 3 => { fpuCompare(s, st0, val); fpuDrop(s); },
             4 => fpuSet(s, 0, st0 - val), 5 => fpuSet(s, 0, val - st0),
             6 => fpuSet(s, 0, st0 / val), 7 => fpuSet(s, 0, val / st0),
             else => {},
@@ -353,6 +387,7 @@ pub fn opDE(s: *CpuState) void { // FADDP/FMULP/etc / int16
 }
 
 pub fn opDF(s: *CpuState) void { // FILD/FISTP int16/int64, FNSTSW AX, FUCOMIP
+    core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
         if (d.reg == 4 and d.rm == 0) {  // FNSTSW AX
@@ -363,13 +398,13 @@ pub fn opDF(s: *CpuState) void { // FILD/FISTP int16/int64, FNSTSW AX, FUCOMIP
         const r = core.resolveRm(s, d.mod, d.rm); const addr = core.applySegOvr(s, r.addr);
         switch (d.reg) {
             0 => { const raw = core.memRead16(s, addr); fpuPush(s, @floatFromInt(@as(i16, @bitCast(raw)))); },  // FILD m16
-            1 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), .truncate))); _ = fpuPop(s); },  // FISTTP m16
+            1 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), .truncate))); fpuDrop(s); },  // FISTTP m16
             2 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); },  // FIST m16
-            3 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); _ = fpuPop(s); },  // FISTP m16
+            3 => { core.memWrite16(s, addr, @bitCast(fistConvert(i16, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); fpuDrop(s); },  // FISTP m16
             // FILD m64: f80 has 64-bit mantissa — all i64 values are exact, no precision loss.
             5 => { const lo = core.memRead32(s, addr); const hi = core.memReadS32(s, addr + 4); fpuPush(s, @as(f80, @floatFromInt(@as(i64, hi) * @as(i64, 0x100000000) + @as(i64, lo)))); },  // FILD m64
             // FISTP m64: f80→i64 is exact for all representable integers.
-            7 => { const val = fpuGet(s, 0); const bits: u64 = @bitCast(fistConvert(i64, s, val, roundModeFromCw(s.fpu_control_word))); core.memWrite32(s, addr, @truncate(bits)); core.memWrite32(s, addr + 4, @truncate(bits >> 32)); _ = fpuPop(s); },  // FISTP m64
+            7 => { const val = fpuGet(s, 0); const bits: u64 = @bitCast(fistConvert(i64, s, val, roundModeFromCw(s.fpu_control_word))); core.memWrite32(s, addr, @truncate(bits)); core.memWrite32(s, addr + 4, @truncate(bits >> 32)); fpuDrop(s); },  // FISTP m64
             else => {},
         }
     }

@@ -2035,6 +2035,50 @@ test "FISTP m32 on NaN/Inf/out-of-range stores integer indefinite and sets IE --
     try testing.expectEqual(indefinite, runFistp32(2147483647.6, 0x037F, &st));
 }
 
+test "FIST out-of-range stores are counted with the faulting instruction's EIP and source value" {
+    var mem = [_]u8{ 0x90, 0xDB, 0x1D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 57; // nop; fistp dword [0x20]
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.fpu_top = 0;
+    s.fpu_stack[0] = 1.0e30;
+    cpuStep(&s); // nop
+    cpuStep(&s); // the fistp, at EIP 1
+    try testing.expectEqual(@as(u32, 1), s.fist_invalid_count);
+    try testing.expectEqual(@as(u32, 1), s.fist_invalid_eip);
+    try testing.expectEqual(@as(f80, 1.0e30), s.fist_invalid_val);
+    // Caller chain snapshot: a fake two-frame EBP chain in guest memory.
+    // frame at 0x10: [saved ebp = 0x18][ret = 0xAAAA]; frame at 0x18: [saved ebp = 0][ret = 0xBBBB]
+    var mem3 = [_]u8{ 0xDB, 0x1D, 0x30, 0, 0, 0 } ++ [_]u8{0} ** 58;
+    std.mem.writeInt(u32, mem3[0x10..0x14], 0x18, .little);
+    std.mem.writeInt(u32, mem3[0x14..0x18], 0xAAAA, .little);
+    std.mem.writeInt(u32, mem3[0x18..0x1C], 0, .little);
+    std.mem.writeInt(u32, mem3[0x1C..0x20], 0xBBBB, .little);
+    var s3 = CpuState{ .memory = &mem3, .memory_size = mem3.len };
+    s3.regs[EBP] = 0x10;
+    s3.fpu_top = 0;
+    s3.fpu_stack[0] = std.math.nan(f80);
+    cpuStep(&s3);
+    try testing.expectEqual(@as(u32, 0xAAAA), s3.fist_invalid_ret[0]);
+    try testing.expectEqual(@as(u32, 0xBBBB), s3.fist_invalid_ret[1]);
+    try testing.expectEqual(@as(u32, 0), s3.fist_invalid_ret[2]);
+    // A garbage EBP (far out of bounds) must not fault or panic the walk.
+    var mem4 = [_]u8{ 0xDB, 0x1D, 0x30, 0, 0, 0 } ++ [_]u8{0} ** 58;
+    var s4 = CpuState{ .memory = &mem4, .memory_size = mem4.len };
+    s4.regs[EBP] = 0xFFFFFFF0;
+    s4.fpu_top = 0;
+    s4.fpu_stack[0] = std.math.inf(f80);
+    cpuStep(&s4);
+    try testing.expect(!s4.faulted);
+    try testing.expectEqual(@as(u32, 1), s4.fist_invalid_count);
+    try testing.expectEqual(@as(u32, 0), s4.fist_invalid_ret[0]);
+    // An in-range store must NOT be counted.
+    var mem2 = [_]u8{ 0xDB, 0x1D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58;
+    var s2 = CpuState{ .memory = &mem2, .memory_size = mem2.len };
+    s2.fpu_top = 0;
+    s2.fpu_stack[0] = 42.0;
+    cpuStep(&s2);
+    try testing.expectEqual(@as(u32, 0), s2.fist_invalid_count);
+}
+
 test "FISTP m16 and m64 out-of-range store their own width's integer indefinite" {
     var mem16 = [_]u8{ 0xDF, 0x1D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58; // fistp word [0x20]
     var s16 = CpuState{ .memory = &mem16, .memory_size = mem16.len };
@@ -2083,6 +2127,28 @@ test "FSCALE with a huge or NaN scale no longer panics the host" {
     s3.fpu_stack[1] = 2.0;
     cpuStep(&s3);
     try testing.expectEqual(@as(f80, 12.0), s3.fpu_stack[0]);
+}
+
+test "popping x87 handlers do not leak entries on the HOST x87 stack (discarded f80 return regression)" {
+    // Found 2026-09-18 as the root cause of the two-week "FMUL returns NaN on one
+    // call in many" mystery (the game's screen.c(475) assert): fpuPop() returned an
+    // f80, every handler wrote `_ = fpuPop(s);`, and an f80 return lives in ST(0) of
+    // the HOST x87 stack -- Zig does not pop a DISCARDED x87 return, so every popping
+    // handler (FSTP/FISTP/FCOMP/FADDP/...) leaked one host stack entry. After 8, the
+    // next host `fld` overflowed the 8-entry stack and produced a QNaN. 20 FLD1+FSTP
+    // pairs, then one more x87 op so the leak is observed at ITS entry.
+    var mem = [_]u8{0} ** 256;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const o = i * 8;
+        mem[o] = 0xD9; mem[o + 1] = 0xE8;                      // fld1
+        mem[o + 2] = 0xD9; mem[o + 3] = 0x1D; mem[o + 4] = 0xF0; // fstp dword [0xF0]
+    }
+    mem[160] = 0xD9; mem[161] = 0xE8; // final fld1: its entry measures the leftovers
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    var step: usize = 0;
+    while (step < 41) : (step += 1) cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0), s.host_fpu_dirty_count);
 }
 
 test "D7: XLAT loads AL from [EBX+AL], leaves the rest of EAX and all flags alone" {

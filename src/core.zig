@@ -78,19 +78,9 @@ pub const CpuState = struct {
     // that investigation is resolved.
     mmx_call_count: u32 = 0,
     mmx_last_eip: u32 = 0,
-    // TEMPORARY (2026-09-03, cont'd): tew's own fpu_control_word/fpu_stack
-    // are pure software bookkeeping -- the ACTUAL arithmetic (st0*val, an
-    // f80 multiply) runs via the host's real x87 hardware (f80 on x86-64
-    // has no SSE/AVX equivalent, only the legacy x87 unit implements it),
-    // using whatever real control word / stack state the host CPU happens
-    // to have at that instant -- never synced from/to tew's own tracked
-    // copies. Capturing that REAL state right after the multiply (see
-    // captureHostFpuState below) to see if it differs between a working and
-    // a failing call, since nothing read so far (tew's own emulated state)
-    // has ever differed. Remove once resolved.
-    host_fpu_cw: u16 = 0,
-    host_fpu_sw: u16 = 0,
-    host_fpu_st0: f80 = 0,
+    // Test-only regression guard: times the HOST x87 stack was non-empty at an
+    // x87 handler entry (see hostFpuCheck). Stays 0 unless a handler leaks.
+    host_fpu_dirty_count: u32 = 0,
     halted: bool = false,
     faulted: bool = false,
     // Opt-in null-page guard (default off so every existing test's
@@ -141,6 +131,18 @@ pub const CpuState = struct {
     // s.eip has already advanced past the missing opcode byte, so it no
     // longer points at the instruction that actually failed to decode.
     last_instr_eip: u32 = 0,
+    // Observability for x87 FIST/FISTP/FISTTP stores of NaN/Inf/out-of-range
+    // values (which real hardware silently turns into the "integer indefinite"
+    // and which fpu.zig now mirrors instead of panicking the host). Silent on
+    // real hardware, but here it is exactly the signal that upstream float math
+    // produced garbage -- see fpu.zig's fistConvert and TODO.md's screen.c(475)
+    // entry. Zig has no logging; the host polls these via cpu_get_fist_invalid_*.
+    fist_invalid_count: u32 = 0,
+    fist_invalid_eip: u32 = 0,
+    fist_invalid_val: f80 = 0,
+    // Return addresses walked off the EBP chain AT the moment of the store (the
+    // host polls later, by which time the stack has moved on). Zero = chain ended.
+    fist_invalid_ret: [3]u32 = .{ 0, 0, 0 },
     int_handler: ?IntHandlerFn = null,
     memory: [*]u8 = undefined,
     memory_size: usize = 0,
@@ -168,28 +170,20 @@ pub const CpuState = struct {
     step_hook: ?StepHookFn = null,
 };
 
-// TEMPORARY (2026-09-03, screen.c(475) FMUL-NaN investigation): read the
-// REAL host x87 control word, status word (bits 11-13 = the host's own
-// top-of-stack pointer), and a non-destructive peek at the real ST(0)
-// value, right after tew's own f80 arithmetic runs on the host FPU.
-// fld %st(0); fstpt duplicates then pops the duplicate -- net no change to
-// the real stack. Remove once resolved.
-pub fn captureHostFpuState(s: *CpuState) void {
-    var cw: u16 = undefined;
-    var st0: f80 = undefined;
-    // fnstsw's AX-direct form avoids needing a memory constraint for it.
-    const sw = asm volatile ("fnstsw %%ax"
-        : [_] "={ax}" (-> u16),
+// Regression guard for the 2026-09 host-x87 stack leak (see fpu.zig's fpuDrop
+// comment): tew's f80 arithmetic runs on the HOST's real x87 unit, and a handler
+// that leaves an entry on it (e.g. by discarding an f80 return value) makes a
+// later host `fld` overflow into a QNaN. Called at the top of every x87 handler
+// but compiled to a no-op outside `zig build test`, so production pays nothing.
+// fxsave (unlike fnstenv) has no side effects; abridged FTW byte 4 is 0 exactly
+// when the host stack is empty.
+pub fn hostFpuCheck(s: *CpuState) void {
+    if (!@import("builtin").is_test) return;
+    var buf: [512]u8 align(16) = undefined;
+    asm volatile ("fxsave %[b]"
+        : [b] "=m" (buf),
     );
-    asm volatile ("fnstcw %[cw]"
-        : [cw] "=m" (cw),
-    );
-    asm volatile ("fstpt %[st0]"
-        : [st0] "=m" (st0),
-    );
-    s.host_fpu_cw = cw;
-    s.host_fpu_sw = sw;
-    s.host_fpu_st0 = st0;
+    if (buf[4] != 0) s.host_fpu_dirty_count +%= 1;
 }
 
 // ─── Internal helper structs ─────────────────────────────────────────────────
