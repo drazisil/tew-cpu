@@ -154,6 +154,27 @@ export fn cpu_is_fatal_halted(s: *CpuState) bool { return s.fatal_halted; }
 export fn cpu_enable_null_page_guard(s: *CpuState) void {
     s.guard_null_page = true;
 }
+// stdcall callee-cleanup for a Python API handler reached through an
+// `INT 0xFE; RET` trampoline: the trampoline's plain RET can't pop the args,
+// so move the return address up over them (ret=[esp]; esp+=n; [esp]=ret)
+// and let RET land there. One FFI crossing instead of the six the Python
+// version needed (3x ESP read, ESP write, read32, write32) on every API call.
+// Raw bounds-checked buffer access, same as mem_read32/mem_write32: this is
+// emulator bookkeeping, not a guest store, so it must not trip watchpoints,
+// the write-history hook, or the null-page guard. Returns false (touching
+// nothing) if either stack slot is out of bounds.
+export fn cpu_stdcall_cleanup(s: *CpuState, arg_bytes: u32) bool {
+    const esp = s.regs[ESP];
+    const new_esp = esp +% arg_bytes;
+    var ret: u32 = undefined;
+    if (!mem_read32(s.memory, s.memory_size, esp, &ret)) return false;
+    if (!primitives.inBoundsWidth(s.memory_size, new_esp, 4)) return false;
+    // Same fatal-halt register freeze as cpu_set_reg, which the Python
+    // version went through.
+    if (!s.fatal_halted) s.regs[ESP] = new_esp;
+    _ = mem_write32(s.memory, s.memory_size, new_esp, ret);
+    return true;
+}
 export fn cpu_get_step_count(s: *CpuState) u64 { return s.step_count; }
 export fn cpu_get_run_id(s: *CpuState) u64 { return s.run_id; }
 export fn cpu_get_last_opcode(s: *CpuState) u8 { return s.last_opcode; }
@@ -523,6 +544,31 @@ test "mem_read32/mem_write32 little-endian round-trip" {
     var out: u32 = undefined;
     try testing.expect(mem_read32(&buf, buf.len, 0, &out));
     try testing.expectEqual(@as(u32, 0x12345678), out);
+}
+
+test "cpu_stdcall_cleanup moves the return address over the args" {
+    var buf = [_]u8{0} ** 64;
+    const s = cpu_create(&buf, buf.len) orelse return error.OutOfMemory;
+    defer cpu_destroy(s);
+    s.regs[ESP] = 16;
+    try testing.expect(mem_write32(&buf, buf.len, 16, 0xDEADBEEF));
+    try testing.expect(cpu_stdcall_cleanup(s, 12));
+    try testing.expectEqual(@as(u32, 28), s.regs[ESP]);
+    var out: u32 = undefined;
+    try testing.expect(mem_read32(&buf, buf.len, 28, &out));
+    try testing.expectEqual(@as(u32, 0xDEADBEEF), out);
+}
+
+test "cpu_stdcall_cleanup rejects out-of-bounds slots without touching ESP" {
+    var buf = [_]u8{0} ** 32;
+    const s = cpu_create(&buf, buf.len) orelse return error.OutOfMemory;
+    defer cpu_destroy(s);
+    s.regs[ESP] = 20;
+    try testing.expect(!cpu_stdcall_cleanup(s, 12)); // new slot at 32 is past the end
+    try testing.expectEqual(@as(u32, 20), s.regs[ESP]);
+    s.regs[ESP] = 30;
+    try testing.expect(!cpu_stdcall_cleanup(s, 0)); // [esp] itself straddles the end
+    try testing.expectEqual(@as(u32, 30), s.regs[ESP]);
 }
 
 test "mem_read_signed32 sign-extends" {

@@ -4,6 +4,19 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-26 — Add `cpu_stdcall_cleanup`
+
+New export for hosts that implement API calls as `INT n; RET` trampolines:
+moves the return address over a stdcall callee's args (`ret=[esp];
+esp+=n; [esp]=ret`) in one call, so the host no longer needs six separate
+register/memory crossings per API call. Uses raw bounds-checked buffer
+access (like `mem_read32`/`mem_write32`), so it does not trip watchpoints,
+the write-history hook, or the null-page guard; returns false without
+touching anything if either stack slot is out of bounds. ESP is left
+unchanged while fatal-halted, matching `cpu_set_reg`.
+
+---
+
 ## 2026-08-06 — Extracted to its own repo (drazisil/tew-cpu); ported pe-walker's
 5 unported instruction-coverage fixes
 
