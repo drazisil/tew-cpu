@@ -380,6 +380,15 @@ export fn scheduler_handle_at_idx(s: *SchedulerState, idx: u32) i64 {
 export fn scheduler_current_handle(s: *SchedulerState) u32 {
     return scheduler.currentHandle(s);
 }
+// The current thread's id in one call, or -1 if no thread is current. Hot:
+// every EnterCriticalSection/LeaveCriticalSection/TLS call needs it, and the
+// host previously paid three crossings (current_idx, current_handle, then
+// get_thread_id's handle search) plus a proxy object for it.
+export fn scheduler_current_thread_id(s: *SchedulerState) i64 {
+    if (s.current_idx < 0) return -1;
+    const idx: usize = @intCast(s.current_idx);
+    return s.threads[idx].thread_id;
+}
 
 // ─── Execution-history capture (see history/capture.zig) ───────────────────
 const history_capture = @import("history/capture.zig");
@@ -508,6 +517,17 @@ pub export fn mem_is_valid_range(size: usize, addr: u32, range_size: usize) bool
     return primitives.inBoundsWidth(size, addr, @intCast(range_size));
 }
 
+
+test "scheduler_current_thread_id follows current_idx, -1 when none" {
+    var sched = SchedulerState{};
+    try testing.expectEqual(@as(i64, -1), scheduler_current_thread_id(&sched));
+    scheduler.createMainThread(&sched, 1000, 0xBEEF);
+    try testing.expectEqual(@as(i64, 1000), scheduler_current_thread_id(&sched));
+    sched.threads[1] = .{ .thread_id = 0x3F8, .handle = 0xBEF0 };
+    sched.thread_count = 2;
+    sched.current_idx = 1;
+    try testing.expectEqual(@as(i64, 0x3F8), scheduler_current_thread_id(&sched));
+}
 
 test "mem_read8/mem_write8 round-trip" {
     var buf = [_]u8{0} ** 16;

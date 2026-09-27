@@ -4,6 +4,15 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-27 — Add `scheduler_current_thread_id`
+
+Returns the current thread's id in one call (-1 when no thread is current).
+Hosts needed three calls for it before (`scheduler_current_idx`,
+`scheduler_current_handle`, then `scheduler_get_thread_id`, which searches
+threads by handle), on paths as hot as every EnterCriticalSection.
+
+---
+
 ## 2026-09-26 — Add `cpu_stdcall_cleanup`
 
 New export for hosts that implement API calls as `INT n; RET` trampolines:
