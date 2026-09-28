@@ -27,6 +27,10 @@ pub const TEB_BASE: u32 = 0x00320000;
 const TLS_TEB_OFFSET: u32 = 0xE0;
 const LAST_ERROR_TEB_OFFSET: u32 = 0x34;
 const EXCEPTION_LIST_TEB_OFFSET: u32 = 0x00; // NT_TIB.ExceptionList, real Windows offset
+// ClientId.UniqueThread: real code reads the thread id straight from
+// fs:[0x24] (ntdll's RtlEnterCriticalSection stores it as OwningThread), so
+// it must match GetCurrentThreadId for whichever thread is running.
+const THREAD_ID_TEB_OFFSET: u32 = 0x24;
 pub const THREAD_STACK_BASE: u32 = 0x08000000;
 pub const THREAD_STACK_SIZE: u32 = 256 * 1024;
 pub const THREAD_SENTINEL: u32 = 0x001FE000;
@@ -170,6 +174,7 @@ pub fn loadThread(sched: *SchedulerState, cpu: *CpuState, idx: u32) void {
     loadTls(sched, cpu, t);
     core.memWrite32(cpu, TEB_BASE + LAST_ERROR_TEB_OFFSET, t.last_error);
     core.memWrite32(cpu, TEB_BASE + EXCEPTION_LIST_TEB_OFFSET, t.exception_list);
+    core.memWrite32(cpu, TEB_BASE + THREAD_ID_TEB_OFFSET, t.thread_id);
     cpu.regs = t.saved.regs;
     cpu.eip = t.saved.eip;
     cpu.eflags = t.saved.eflags;
@@ -214,6 +219,7 @@ pub fn initThreadStack(sched: *SchedulerState, cpu: *CpuState, idx: u32) void {
     core.memWrite32(cpu, esp, THREAD_SENTINEL);
     core.memWrite32(cpu, TEB_BASE + LAST_ERROR_TEB_OFFSET, t.last_error); // fresh thread: last_error=0
     core.memWrite32(cpu, TEB_BASE + EXCEPTION_LIST_TEB_OFFSET, t.exception_list); // fresh thread: empty SEH chain
+    core.memWrite32(cpu, TEB_BASE + THREAD_ID_TEB_OFFSET, t.thread_id);
     cpu.regs[EAX] = 0;
     cpu.regs[ECX] = 0;
     cpu.regs[EDX] = 0;
@@ -899,6 +905,19 @@ test "switch_to saves the outgoing thread's own ExceptionList and restores it on
     _ = switchTo(&sched, &cpu, 0); // back to thread 0
 
     try testing.expectEqual(@as(u32, 0xAAAAAAAA), core.memRead32(&cpu, TEB_BASE + 0x00));
+}
+
+test "switch_to writes the incoming thread's id to TEB ClientId.UniqueThread" {
+    var sched = twoThreadSched();
+    const mem = try allocTestMem();
+    defer testing.allocator.free(mem);
+    var cpu = testCpu(mem);
+
+    _ = switchTo(&sched, &cpu, 1); // fresh thread -> initThreadStack path
+    try testing.expectEqual(@as(u32, 1001), core.memRead32(&cpu, TEB_BASE + 0x24));
+
+    _ = switchTo(&sched, &cpu, 0); // resume -> loadThread path
+    try testing.expectEqual(@as(u32, 1000), core.memRead32(&cpu, TEB_BASE + 0x24));
 }
 
 test "switch_to clears cpu.halted after load" {
