@@ -280,8 +280,8 @@ export fn scheduler_switch_to(s: *SchedulerState, cpu: *CpuState, idx: u32) bool
 export fn scheduler_preempt_slice(s: *SchedulerState, cpu: *CpuState) bool {
     return scheduler.preemptSlice(s, cpu);
 }
-export fn scheduler_pick_next_ready(s: *SchedulerState, cpu: *CpuState) i32 {
-    if (scheduler.pickNextReady(s, cpu)) |idx| return @intCast(idx);
+export fn scheduler_pick_next_ready(s: *SchedulerState) i32 {
+    if (scheduler.pickNextReady(s)) |idx| return @intCast(idx);
     return -1;
 }
 export fn scheduler_enter_reentrant_call(s: *SchedulerState) void {
@@ -318,9 +318,6 @@ export fn scheduler_set_virtual_ticks_ms(s: *SchedulerState, val: u32) void {
 // two-call kernel-tick protocol these `complete_*` wrappers are one half of
 // -- callers MUST resolve `next_idx` via scheduler_pick_next_ready (with a
 // Kernel.tick() retry on -1) themselves; these do not scan.
-export fn scheduler_complete_block_on_cs(s: *SchedulerState, cpu: *CpuState, cs_ptr: u32, retry_eip: u32, next_idx: i32) bool {
-    return scheduler.completeBlockOnCs(s, cpu, cs_ptr, retry_eip, next_idx);
-}
 export fn scheduler_complete_block_on_handles(s: *SchedulerState, cpu: *CpuState, handles: [*]const u32, handles_count: u32, retry_eip: u32, has_deadline: bool, deadline_ms: u32, next_idx: i32) bool {
     return scheduler.completeBlockOnHandles(s, cpu, handles[0..handles_count], retry_eip, has_deadline, deadline_ms, next_idx);
 }
@@ -332,9 +329,6 @@ export fn scheduler_complete_mark_current_dead(s: *SchedulerState, cpu: *CpuStat
 }
 export fn scheduler_terminate_thread(s: *SchedulerState, cpu: *CpuState, handle: u32, next_idx: i32) i8 {
     return scheduler.terminateThread(s, cpu, handle, next_idx);
-}
-export fn scheduler_unblock_cs(s: *SchedulerState, cs_ptr: u32) void {
-    scheduler.unblockCs(s, cs_ptr);
 }
 export fn scheduler_unblock_handle(s: *SchedulerState, handle: u32) u32 {
     return scheduler.unblockHandle(s, handle);
@@ -801,7 +795,7 @@ test "public C ABI: scheduler block_on_handles -> pick_next_ready -> unblock -> 
 
     // Block the main thread on a handle; the two-call protocol: resolve
     // next_idx via pick_next_ready first, then complete the block.
-    const next_idx = scheduler_pick_next_ready(sched, cpu);
+    const next_idx = scheduler_pick_next_ready(sched);
     try testing.expectEqual(@as(i32, 1), next_idx);
     const handles = [_]u32{0x700B};
     const blocked = scheduler_complete_block_on_handles(sched, cpu, &handles, handles.len, 0x401000, true, 500, next_idx);
@@ -849,7 +843,7 @@ test "public C ABI: scheduler TLS bitset + handle-keyed accessors" {
     try testing.expectEqual(@as(u32, 12345), scheduler_get_virtual_ticks_ms(sched));
 }
 
-test "public C ABI: scheduler create 2 threads, preempt, block on CS, unblock, verify swap" {
+test "public C ABI: scheduler create 2 threads, preempt, block on a handle, unblock, verify swap" {
     const mem = try testing.allocator.alloc(u8, 0x00340000);
     defer testing.allocator.free(mem);
     @memset(mem, 0);
@@ -867,11 +861,12 @@ test "public C ABI: scheduler create 2 threads, preempt, block on CS, unblock, v
     try testing.expectEqual(@as(i32, 1), scheduler_current_idx(sched));
     try testing.expectEqual(@as(u32, 0x9F0000), cpu_get_eip(cpu));
 
-    // idx 1 blocks on a contested CS; two-call protocol: resolve next_idx
+    // idx 1 blocks on an unsignaled handle; two-call protocol: resolve next_idx
     // via pick_next_ready first (finds idx 0, READY), then complete.
-    const next_idx = scheduler_pick_next_ready(sched, cpu);
+    const next_idx = scheduler_pick_next_ready(sched);
     try testing.expectEqual(@as(i32, 0), next_idx);
-    const blocked = scheduler_complete_block_on_cs(sched, cpu, 0xCAFE, 0x9F0010, next_idx);
+    const handles = [_]u32{0xCAFE};
+    const blocked = scheduler_complete_block_on_handles(sched, cpu, &handles, handles.len, 0x9F0010, false, 0, next_idx);
     try testing.expect(blocked);
     try testing.expectEqual(@as(i32, 0), scheduler_current_idx(sched));
     // eip restored to idx 0's saved state (from the earlier preempt's save),
@@ -879,10 +874,10 @@ test "public C ABI: scheduler create 2 threads, preempt, block on CS, unblock, v
     try testing.expectEqual(@as(u32, 0), cpu_get_eip(cpu));
 
     // unblock: idx 1 becomes READY again but current thread (idx 0) doesn't
-    // move on its own -- unblock_cs only flips the flag, matching the real
-    // LeaveCriticalSection handler that calls it.
-    scheduler_unblock_cs(sched, 0xCAFE);
-    const after_unblock = scheduler_pick_next_ready(sched, cpu);
+    // move on its own -- unblock_handle only flips the flag, matching the
+    // real SetEvent handler that calls it.
+    try testing.expectEqual(@as(u32, 1), scheduler_unblock_handle(sched, 0xCAFE));
+    const after_unblock = scheduler_pick_next_ready(sched);
     try testing.expectEqual(@as(i32, 1), after_unblock);
 
     const swapped = scheduler_switch_to(sched, cpu, 1);

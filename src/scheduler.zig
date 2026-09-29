@@ -44,7 +44,7 @@ pub const MAX_THREADS: usize = 64;
 pub const TLS_MAX_SLOTS: usize = 64;
 pub const MAX_WAIT_HANDLES: usize = 64;
 
-pub const ThreadStatus = enum(u8) { ready, blocked_cs, blocked_handles, sleeping, dead };
+pub const ThreadStatus = enum(u8) { ready, blocked_handles, sleeping, dead };
 
 pub const SavedRegs = struct {
     regs: [8]u32 = .{0} ** 8,
@@ -80,7 +80,6 @@ pub const ThreadEntry = struct {
     // initial state (kernel_structures.py's own TEB init writes the same
     // value for the same field).
     exception_list: u32 = 0xFFFFFFFF,
-    waiting_on_cs: u32 = 0, // 0 = sentinel "not waiting" -- no legit guest CS pointer is ever 0
     wait_handles: [MAX_WAIT_HANDLES]u32 = .{0} ** MAX_WAIT_HANDLES,
     wait_handle_count: u8 = 0,
     wait_deadline_ms: ?u32 = null,
@@ -249,7 +248,7 @@ pub fn loadNext(sched: *SchedulerState, cpu: *CpuState, idx: u32) void {
 // Decision 2, that stays an explicit Python-driven two-call retry: callers
 // that get null back call self._kernel.tick() then retry this once, rather
 // than this function calling back into Python mid-scan.
-pub fn pickNextReady(sched: *SchedulerState, cpu: *CpuState) ?u32 {
+pub fn pickNextReady(sched: *SchedulerState) ?u32 {
     const n = sched.thread_count;
     if (n == 0) return null;
     const start = (sched.last_scheduled_idx + 1) % n;
@@ -263,14 +262,6 @@ pub fn pickNextReady(sched: *SchedulerState, cpu: *CpuState) ?u32 {
         if (t.status == .dead) continue;
         if (t.status == .sleeping) {
             if (sched.virtual_ticks_ms < t.sleep_until_ms) continue;
-            t.status = .ready;
-        }
-        if (t.status == .blocked_cs) {
-            if (t.waiting_on_cs != 0) {
-                const owner = core.memRead32(cpu, t.waiting_on_cs +% 0x0C);
-                if (owner != 0) continue;
-            }
-            t.waiting_on_cs = 0;
             t.status = .ready;
         }
         if (t.status == .blocked_handles) {
@@ -397,29 +388,6 @@ pub fn preemptSlice(sched: *SchedulerState, cpu: *CpuState) bool {
 // (never trust the caller alone) -- each returns false, untouched, if either
 // guard fires, exactly mirroring Python's own top-of-function short-circuit.
 
-pub fn completeBlockOnCs(sched: *SchedulerState, cpu: *CpuState, cs_ptr: u32, retry_eip: u32, next_idx: i32) bool {
-    if (cpu.fatal_halted) return false; // single core, fatally locked up -- nothing left to block/resume
-    if (!reentrancyOk(sched)) {
-        // Caller (e.g. _enter_cs) already skipped its own cleanup_stdcall on
-        // this path, trusting the scheduler to redirect eip -- see the
-        // matching Stage 1 comment on the same theme.
-        cpu.eip = retry_eip;
-        return false;
-    }
-    const cur: usize = @intCast(sched.current_idx);
-    var t = &sched.threads[cur];
-    t.waiting_on_cs = cs_ptr;
-    t.status = .blocked_cs;
-    cpu.eip = retry_eip;
-    if (next_idx < 0) {
-        t.status = .ready;
-        _ = swapCurrent(sched, cpu, @intCast(cur));
-        return true;
-    }
-    _ = swapCurrent(sched, cpu, @intCast(next_idx));
-    return true;
-}
-
 pub fn completeBlockOnHandles(sched: *SchedulerState, cpu: *CpuState, handles: []const u32, retry_eip: u32, has_deadline: bool, deadline_ms: u32, next_idx: i32) bool {
     if (cpu.fatal_halted) return false;
     if (!reentrancyOk(sched)) {
@@ -516,17 +484,6 @@ pub fn terminateThread(sched: *SchedulerState, cpu: *CpuState, handle: u32, next
 // ─── Public: unblocking ───────────────────────────────────────────────────────
 // No reentrancy interaction at all -- these only flip *other* threads'
 // status flags, never touch cpu or the current thread.
-
-pub fn unblockCs(sched: *SchedulerState, cs_ptr: u32) void {
-    var i: u32 = 0;
-    while (i < sched.thread_count) : (i += 1) {
-        var t = &sched.threads[i];
-        if (t.status == .blocked_cs and t.waiting_on_cs == cs_ptr) {
-            t.waiting_on_cs = 0;
-            t.status = .ready;
-        }
-    }
-}
 
 pub fn unblockHandle(sched: *SchedulerState, handle: u32) u32 {
     var n: u32 = 0;
@@ -723,29 +680,20 @@ test "create_thread suspended flag" {
 
 test "pick_next_ready picks background thread, skips current" {
     var sched = twoThreadSched();
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    const idx = pickNextReady(&sched, &cpu);
+    const idx = pickNextReady(&sched);
     try testing.expectEqual(@as(?u32, 1), idx);
 }
 
 test "pick_next_ready skips dead" {
     var sched = twoThreadSched();
     sched.threads[1].status = .dead;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    try testing.expectEqual(@as(?u32, null), pickNextReady(&sched, &cpu));
+    try testing.expectEqual(@as(?u32, null), pickNextReady(&sched));
 }
 
 test "pick_next_ready skips suspended" {
     var sched = twoThreadSched();
     sched.threads[1].suspended = true;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    try testing.expectEqual(@as(?u32, null), pickNextReady(&sched, &cpu));
+    try testing.expectEqual(@as(?u32, null), pickNextReady(&sched));
 }
 
 test "pick_next_ready falls back to earliest sleeper when none due" {
@@ -753,10 +701,7 @@ test "pick_next_ready falls back to earliest sleeper when none due" {
     sched.threads[1].status = .sleeping;
     sched.threads[1].sleep_until_ms = 9999;
     sched.virtual_ticks_ms = 0;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    const idx = pickNextReady(&sched, &cpu);
+    const idx = pickNextReady(&sched);
     try testing.expectEqual(@as(?u32, 1), idx);
     try testing.expectEqual(ThreadStatus.ready, sched.threads[1].status);
 }
@@ -766,47 +711,16 @@ test "pick_next_ready wakes sleeping thread when due" {
     sched.threads[1].status = .sleeping;
     sched.threads[1].sleep_until_ms = 100;
     sched.virtual_ticks_ms = 100;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    const idx = pickNextReady(&sched, &cpu);
+    const idx = pickNextReady(&sched);
     try testing.expectEqual(@as(?u32, 1), idx);
     try testing.expectEqual(ThreadStatus.ready, sched.threads[1].status);
-}
-
-test "pick_next_ready skips blocked_cs when owner nonzero" {
-    var sched = twoThreadSched();
-    sched.threads[1].status = .blocked_cs;
-    sched.threads[1].waiting_on_cs = 0x1234;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    core.memWrite32(&cpu, 0x1234 + 0x0C, 0x3E9); // non-zero owner
-    try testing.expectEqual(@as(?u32, null), pickNextReady(&sched, &cpu));
-}
-
-test "pick_next_ready unblocks blocked_cs when owner free" {
-    var sched = twoThreadSched();
-    sched.threads[1].status = .blocked_cs;
-    sched.threads[1].waiting_on_cs = 0x1234;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    core.memWrite32(&cpu, 0x1234 + 0x0C, 0); // CS free
-    const idx = pickNextReady(&sched, &cpu);
-    try testing.expectEqual(@as(?u32, 1), idx);
-    try testing.expectEqual(ThreadStatus.ready, sched.threads[1].status);
-    try testing.expectEqual(@as(u32, 0), sched.threads[1].waiting_on_cs);
 }
 
 test "pick_next_ready falls back to blocked_handles" {
     var sched = twoThreadSched();
     sched.threads[1].status = .blocked_handles;
     sched.threads[1].wait_deadline_ms = null;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    const idx = pickNextReady(&sched, &cpu);
+    const idx = pickNextReady(&sched);
     try testing.expectEqual(@as(?u32, 1), idx);
     try testing.expectEqual(ThreadStatus.ready, sched.threads[1].status);
 }
@@ -816,10 +730,7 @@ test "pick_next_ready unblocks handles on deadline" {
     sched.threads[1].status = .blocked_handles;
     sched.threads[1].wait_deadline_ms = 50;
     sched.virtual_ticks_ms = 50;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    const idx = pickNextReady(&sched, &cpu);
+    const idx = pickNextReady(&sched);
     try testing.expectEqual(@as(?u32, 1), idx);
     try testing.expect(sched.threads[1].wait_timed_out);
     try testing.expectEqual(ThreadStatus.ready, sched.threads[1].status);
@@ -832,10 +743,7 @@ test "pick_next_ready round robin" {
     _ = createThread(&sched, 1001, 0xBEF0, 0x9F0000, 0x0, false);
     _ = createThread(&sched, 1002, 0xBEF1, 0x9F0000, 0x0, false);
     sched.last_scheduled_idx = 1;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    try testing.expectEqual(@as(?u32, 2), pickNextReady(&sched, &cpu));
+    try testing.expectEqual(@as(?u32, 2), pickNextReady(&sched));
 }
 
 // ── switch_to ────────────────────────────────────────────────────────────────
@@ -1094,84 +1002,13 @@ test "enter then exit restores normal swapping" {
     try testing.expect(allowed);
 }
 
-// ── complete_block_on_cs ──────────────────────────────────────────────────────
+// ── complete_block_on_handles ─────────────────────────────────────────────────
 // Two variants per operation, unlike the Python suite's single mock-backed
 // test: with real (not MagicMock) state, restoring a genuinely different
 // thread's saved registers really does overwrite cpu.eip, so "eip was
 // redirected to retry_eip" and "we really swapped to the next thread" have to
 // be checked in different scenarios (self-reload vs switch-away) rather than
 // both asserted on the same call.
-
-test "complete_block_on_cs self-reload sets status/waiting_on_cs and redirects eip" {
-    var sched = SchedulerState{};
-    createMainThread(&sched, 1000, 0xBEEF); // only thread -- next_idx will be -1
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    cpu.eip = 0x401002;
-
-    const result = completeBlockOnCs(&sched, &cpu, 0x1234, 0x401000, -1);
-
-    try testing.expect(result);
-    try testing.expect(!cpu.halted);
-    try testing.expectEqual(ThreadStatus.ready, sched.threads[0].status);
-    try testing.expectEqual(@as(u32, 0x1234), sched.threads[0].waiting_on_cs); // NOT cleared (matches Python)
-    try testing.expectEqual(@as(u32, 0x401000), cpu.eip);
-}
-
-test "complete_block_on_cs switches to resolved next thread" {
-    var sched = twoThreadSched();
-    sched.threads[1].has_run = true;
-    sched.threads[1].saved.eip = 0x9F1234;
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    cpu.eip = 0x401002;
-
-    const result = completeBlockOnCs(&sched, &cpu, 0x1234, 0x401000, 1);
-
-    try testing.expect(result);
-    try testing.expectEqual(@as(i32, 1), sched.current_idx);
-    try testing.expectEqual(@as(u32, 0x9F1234), cpu.eip); // next thread's real state, not retry_eip
-    try testing.expectEqual(ThreadStatus.blocked_cs, sched.threads[0].status);
-    try testing.expectEqual(@as(u32, 0x1234), sched.threads[0].waiting_on_cs);
-    try testing.expectEqual(@as(u32, 0x401000), sched.threads[0].saved.eip); // retry_eip captured by saveCurrent
-}
-
-test "complete_block_on_cs refused while reentrant still redirects eip" {
-    var sched = twoThreadSched();
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    cpu.eip = 0x401002;
-    enterReentrantCall(&sched);
-
-    const result = completeBlockOnCs(&sched, &cpu, 0x1234, 0x401000, 1);
-
-    try testing.expect(!result);
-    try testing.expectEqual(@as(u32, 0x401000), cpu.eip); // redirected even on refusal
-    try testing.expectEqual(@as(i32, 0), sched.current_idx);
-    try testing.expectEqual(ThreadStatus.ready, sched.threads[0].status); // never marked blocked
-}
-
-test "complete_block_on_cs does not touch cpu.halted when fatal_halted" {
-    var sched = twoThreadSched();
-    const mem = try allocTestMem();
-    defer testing.allocator.free(mem);
-    var cpu = testCpu(mem);
-    cpu.eip = 0x401002;
-    cpu.halted = true;
-    cpu.fatal_halted = true;
-
-    const result = completeBlockOnCs(&sched, &cpu, 0x1234, 0x401000, 1);
-
-    try testing.expect(!result);
-    try testing.expect(cpu.halted);
-    try testing.expectEqual(@as(u32, 0x401002), cpu.eip); // untouched, unlike the reentrancy-refusal case
-    try testing.expectEqual(ThreadStatus.ready, sched.threads[0].status);
-}
-
-// ── complete_block_on_handles ─────────────────────────────────────────────────
 
 test "complete_block_on_handles self-reload clears wait state and redirects eip" {
     var sched = SchedulerState{};
@@ -1187,7 +1024,7 @@ test "complete_block_on_handles self-reload clears wait state and redirects eip"
     try testing.expect(result);
     try testing.expect(!cpu.halted);
     try testing.expectEqual(ThreadStatus.ready, sched.threads[0].status);
-    try testing.expectEqual(@as(u8, 0), sched.threads[0].wait_handle_count); // cleared, unlike block_on_cs
+    try testing.expectEqual(@as(u8, 0), sched.threads[0].wait_handle_count); // cleared
     try testing.expectEqual(@as(?u32, null), sched.threads[0].wait_deadline_ms);
     try testing.expectEqual(@as(u32, 0x401000), cpu.eip);
 }
@@ -1426,48 +1263,6 @@ test "terminate_thread still swaps while reentrant" {
     try testing.expectEqual(@as(i32, 1), sched.current_idx);
 }
 
-// ── unblock_cs ─────────────────────────────────────────────────────────────────
-
-test "unblock_cs marks waiting thread ready" {
-    var sched = twoThreadSched();
-    sched.threads[1].status = .blocked_cs;
-    sched.threads[1].waiting_on_cs = 0x1234;
-
-    unblockCs(&sched, 0x1234);
-
-    try testing.expectEqual(ThreadStatus.ready, sched.threads[1].status);
-    try testing.expectEqual(@as(u32, 0), sched.threads[1].waiting_on_cs);
-}
-
-test "unblock_cs does not affect other cs" {
-    var sched = twoThreadSched();
-    sched.threads[1].status = .blocked_cs;
-    sched.threads[1].waiting_on_cs = 0x5678;
-
-    unblockCs(&sched, 0x1234);
-
-    try testing.expectEqual(ThreadStatus.blocked_cs, sched.threads[1].status);
-}
-
-test "unblock_cs unblocks multiple waiters" {
-    var sched = SchedulerState{};
-    sched.thread_stack_next = 0x1000;
-    createMainThread(&sched, 1000, 0xBEEF);
-    var i: u32 = 0;
-    while (i < 3) : (i += 1) {
-        const idx = createThread(&sched, 1001 + i, 0xBEF0 + i, 0x9F0000, 0x0, false);
-        sched.threads[idx].status = .blocked_cs;
-        sched.threads[idx].waiting_on_cs = 0x1234;
-    }
-
-    unblockCs(&sched, 0x1234);
-
-    i = 1;
-    while (i < sched.thread_count) : (i += 1) {
-        try testing.expectEqual(ThreadStatus.ready, sched.threads[i].status);
-    }
-}
-
 // ── unblock_handle ────────────────────────────────────────────────────────────
 
 test "unblock_handle marks waiting thread ready" {
@@ -1625,8 +1420,8 @@ test "get_wait_timed_out/set_wait_timed_out round-trip via handle" {
 test "get_status returns thread status, 0xFF for unknown handle" {
     var sched = twoThreadSched();
     try testing.expectEqual(@as(u8, @intFromEnum(ThreadStatus.ready)), getStatus(&sched, 0xBEF0));
-    sched.threads[1].status = .blocked_cs;
-    try testing.expectEqual(@as(u8, @intFromEnum(ThreadStatus.blocked_cs)), getStatus(&sched, 0xBEF0));
+    sched.threads[1].status = .blocked_handles;
+    try testing.expectEqual(@as(u8, @intFromEnum(ThreadStatus.blocked_handles)), getStatus(&sched, 0xBEF0));
     try testing.expectEqual(@as(u8, 0xFF), getStatus(&sched, 0xDEADBEEF));
 }
 
