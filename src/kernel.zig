@@ -154,6 +154,27 @@ export fn cpu_is_fatal_halted(s: *CpuState) bool { return s.fatal_halted; }
 export fn cpu_enable_null_page_guard(s: *CpuState) void {
     s.guard_null_page = true;
 }
+// stdcall callee-cleanup for a Python API handler reached through an
+// `INT 0xFE; RET` trampoline: the trampoline's plain RET can't pop the args,
+// so move the return address up over them (ret=[esp]; esp+=n; [esp]=ret)
+// and let RET land there. One FFI crossing instead of the six the Python
+// version needed (3x ESP read, ESP write, read32, write32) on every API call.
+// Raw bounds-checked buffer access, same as mem_read32/mem_write32: this is
+// emulator bookkeeping, not a guest store, so it must not trip watchpoints,
+// the write-history hook, or the null-page guard. Returns false (touching
+// nothing) if either stack slot is out of bounds.
+export fn cpu_stdcall_cleanup(s: *CpuState, arg_bytes: u32) bool {
+    const esp = s.regs[ESP];
+    const new_esp = esp +% arg_bytes;
+    var ret: u32 = undefined;
+    if (!mem_read32(s.memory, s.memory_size, esp, &ret)) return false;
+    if (!primitives.inBoundsWidth(s.memory_size, new_esp, 4)) return false;
+    // Same fatal-halt register freeze as cpu_set_reg, which the Python
+    // version went through.
+    if (!s.fatal_halted) s.regs[ESP] = new_esp;
+    _ = mem_write32(s.memory, s.memory_size, new_esp, ret);
+    return true;
+}
 export fn cpu_get_step_count(s: *CpuState) u64 { return s.step_count; }
 export fn cpu_get_run_id(s: *CpuState) u64 { return s.run_id; }
 export fn cpu_get_last_opcode(s: *CpuState) u8 { return s.last_opcode; }
@@ -259,8 +280,8 @@ export fn scheduler_switch_to(s: *SchedulerState, cpu: *CpuState, idx: u32) bool
 export fn scheduler_preempt_slice(s: *SchedulerState, cpu: *CpuState) bool {
     return scheduler.preemptSlice(s, cpu);
 }
-export fn scheduler_pick_next_ready(s: *SchedulerState, cpu: *CpuState) i32 {
-    if (scheduler.pickNextReady(s, cpu)) |idx| return @intCast(idx);
+export fn scheduler_pick_next_ready(s: *SchedulerState) i32 {
+    if (scheduler.pickNextReady(s)) |idx| return @intCast(idx);
     return -1;
 }
 export fn scheduler_enter_reentrant_call(s: *SchedulerState) void {
@@ -297,9 +318,6 @@ export fn scheduler_set_virtual_ticks_ms(s: *SchedulerState, val: u32) void {
 // two-call kernel-tick protocol these `complete_*` wrappers are one half of
 // -- callers MUST resolve `next_idx` via scheduler_pick_next_ready (with a
 // Kernel.tick() retry on -1) themselves; these do not scan.
-export fn scheduler_complete_block_on_cs(s: *SchedulerState, cpu: *CpuState, cs_ptr: u32, retry_eip: u32, next_idx: i32) bool {
-    return scheduler.completeBlockOnCs(s, cpu, cs_ptr, retry_eip, next_idx);
-}
 export fn scheduler_complete_block_on_handles(s: *SchedulerState, cpu: *CpuState, handles: [*]const u32, handles_count: u32, retry_eip: u32, has_deadline: bool, deadline_ms: u32, next_idx: i32) bool {
     return scheduler.completeBlockOnHandles(s, cpu, handles[0..handles_count], retry_eip, has_deadline, deadline_ms, next_idx);
 }
@@ -311,9 +329,6 @@ export fn scheduler_complete_mark_current_dead(s: *SchedulerState, cpu: *CpuStat
 }
 export fn scheduler_terminate_thread(s: *SchedulerState, cpu: *CpuState, handle: u32, next_idx: i32) i8 {
     return scheduler.terminateThread(s, cpu, handle, next_idx);
-}
-export fn scheduler_unblock_cs(s: *SchedulerState, cs_ptr: u32) void {
-    scheduler.unblockCs(s, cs_ptr);
 }
 export fn scheduler_unblock_handle(s: *SchedulerState, handle: u32) u32 {
     return scheduler.unblockHandle(s, handle);
@@ -358,6 +373,15 @@ export fn scheduler_handle_at_idx(s: *SchedulerState, idx: u32) i64 {
 }
 export fn scheduler_current_handle(s: *SchedulerState) u32 {
     return scheduler.currentHandle(s);
+}
+// The current thread's id in one call, or -1 if no thread is current. Hot:
+// every EnterCriticalSection/LeaveCriticalSection/TLS call needs it, and the
+// host previously paid three crossings (current_idx, current_handle, then
+// get_thread_id's handle search) plus a proxy object for it.
+export fn scheduler_current_thread_id(s: *SchedulerState) i64 {
+    if (s.current_idx < 0) return -1;
+    const idx: usize = @intCast(s.current_idx);
+    return s.threads[idx].thread_id;
 }
 
 // ─── Execution-history capture (see history/capture.zig) ───────────────────
@@ -488,6 +512,17 @@ pub export fn mem_is_valid_range(size: usize, addr: u32, range_size: usize) bool
 }
 
 
+test "scheduler_current_thread_id follows current_idx, -1 when none" {
+    var sched = SchedulerState{};
+    try testing.expectEqual(@as(i64, -1), scheduler_current_thread_id(&sched));
+    scheduler.createMainThread(&sched, 1000, 0xBEEF);
+    try testing.expectEqual(@as(i64, 1000), scheduler_current_thread_id(&sched));
+    sched.threads[1] = .{ .thread_id = 0x3F8, .handle = 0xBEF0 };
+    sched.thread_count = 2;
+    sched.current_idx = 1;
+    try testing.expectEqual(@as(i64, 0x3F8), scheduler_current_thread_id(&sched));
+}
+
 test "mem_read8/mem_write8 round-trip" {
     var buf = [_]u8{0} ** 16;
     try testing.expect(mem_write8(&buf, buf.len, 0, 0xFF));
@@ -523,6 +558,31 @@ test "mem_read32/mem_write32 little-endian round-trip" {
     var out: u32 = undefined;
     try testing.expect(mem_read32(&buf, buf.len, 0, &out));
     try testing.expectEqual(@as(u32, 0x12345678), out);
+}
+
+test "cpu_stdcall_cleanup moves the return address over the args" {
+    var buf = [_]u8{0} ** 64;
+    const s = cpu_create(&buf, buf.len) orelse return error.OutOfMemory;
+    defer cpu_destroy(s);
+    s.regs[ESP] = 16;
+    try testing.expect(mem_write32(&buf, buf.len, 16, 0xDEADBEEF));
+    try testing.expect(cpu_stdcall_cleanup(s, 12));
+    try testing.expectEqual(@as(u32, 28), s.regs[ESP]);
+    var out: u32 = undefined;
+    try testing.expect(mem_read32(&buf, buf.len, 28, &out));
+    try testing.expectEqual(@as(u32, 0xDEADBEEF), out);
+}
+
+test "cpu_stdcall_cleanup rejects out-of-bounds slots without touching ESP" {
+    var buf = [_]u8{0} ** 32;
+    const s = cpu_create(&buf, buf.len) orelse return error.OutOfMemory;
+    defer cpu_destroy(s);
+    s.regs[ESP] = 20;
+    try testing.expect(!cpu_stdcall_cleanup(s, 12)); // new slot at 32 is past the end
+    try testing.expectEqual(@as(u32, 20), s.regs[ESP]);
+    s.regs[ESP] = 30;
+    try testing.expect(!cpu_stdcall_cleanup(s, 0)); // [esp] itself straddles the end
+    try testing.expectEqual(@as(u32, 30), s.regs[ESP]);
 }
 
 test "mem_read_signed32 sign-extends" {
@@ -735,7 +795,7 @@ test "public C ABI: scheduler block_on_handles -> pick_next_ready -> unblock -> 
 
     // Block the main thread on a handle; the two-call protocol: resolve
     // next_idx via pick_next_ready first, then complete the block.
-    const next_idx = scheduler_pick_next_ready(sched, cpu);
+    const next_idx = scheduler_pick_next_ready(sched);
     try testing.expectEqual(@as(i32, 1), next_idx);
     const handles = [_]u32{0x700B};
     const blocked = scheduler_complete_block_on_handles(sched, cpu, &handles, handles.len, 0x401000, true, 500, next_idx);
@@ -783,7 +843,7 @@ test "public C ABI: scheduler TLS bitset + handle-keyed accessors" {
     try testing.expectEqual(@as(u32, 12345), scheduler_get_virtual_ticks_ms(sched));
 }
 
-test "public C ABI: scheduler create 2 threads, preempt, block on CS, unblock, verify swap" {
+test "public C ABI: scheduler create 2 threads, preempt, block on a handle, unblock, verify swap" {
     const mem = try testing.allocator.alloc(u8, 0x00340000);
     defer testing.allocator.free(mem);
     @memset(mem, 0);
@@ -801,11 +861,12 @@ test "public C ABI: scheduler create 2 threads, preempt, block on CS, unblock, v
     try testing.expectEqual(@as(i32, 1), scheduler_current_idx(sched));
     try testing.expectEqual(@as(u32, 0x9F0000), cpu_get_eip(cpu));
 
-    // idx 1 blocks on a contested CS; two-call protocol: resolve next_idx
+    // idx 1 blocks on an unsignaled handle; two-call protocol: resolve next_idx
     // via pick_next_ready first (finds idx 0, READY), then complete.
-    const next_idx = scheduler_pick_next_ready(sched, cpu);
+    const next_idx = scheduler_pick_next_ready(sched);
     try testing.expectEqual(@as(i32, 0), next_idx);
-    const blocked = scheduler_complete_block_on_cs(sched, cpu, 0xCAFE, 0x9F0010, next_idx);
+    const handles = [_]u32{0xCAFE};
+    const blocked = scheduler_complete_block_on_handles(sched, cpu, &handles, handles.len, 0x9F0010, false, 0, next_idx);
     try testing.expect(blocked);
     try testing.expectEqual(@as(i32, 0), scheduler_current_idx(sched));
     // eip restored to idx 0's saved state (from the earlier preempt's save),
@@ -813,10 +874,10 @@ test "public C ABI: scheduler create 2 threads, preempt, block on CS, unblock, v
     try testing.expectEqual(@as(u32, 0), cpu_get_eip(cpu));
 
     // unblock: idx 1 becomes READY again but current thread (idx 0) doesn't
-    // move on its own -- unblock_cs only flips the flag, matching the real
-    // LeaveCriticalSection handler that calls it.
-    scheduler_unblock_cs(sched, 0xCAFE);
-    const after_unblock = scheduler_pick_next_ready(sched, cpu);
+    // move on its own -- unblock_handle only flips the flag, matching the
+    // real SetEvent handler that calls it.
+    try testing.expectEqual(@as(u32, 1), scheduler_unblock_handle(sched, 0xCAFE));
+    const after_unblock = scheduler_pick_next_ready(sched);
     try testing.expectEqual(@as(i32, 1), after_unblock);
 
     const swapped = scheduler_switch_to(sched, cpu, 1);
