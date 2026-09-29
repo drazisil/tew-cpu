@@ -4,6 +4,31 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-29 — 0.3.0: critical sections leave the scheduler (breaking ABI)
+
+Version 0.2.0 -> 0.3.0, covering everything since 0.2.0 (this entry and the
+two below). Breaking for hosts:
+
+- Removed `scheduler_complete_block_on_cs` and `scheduler_unblock_cs`, and
+  the scheduler's `blocked_cs` state with them. Hosts now implement critical
+  sections the way XP does (the lock state lives in the guest's
+  `RTL_CRITICAL_SECTION`, contention waits on its LockSemaphore event via
+  `scheduler_complete_block_on_handles`/`scheduler_unblock_handle`), so the
+  scheduler no longer reads the guest struct's OwningThread to decide wakes.
+- `ThreadStatus` loses `blocked_cs`: `ready=0, blocked_handles=1,
+  sleeping=2, dead=3` (`blocked_handles` and later shift down by one) --
+  affects `scheduler_get_status`.
+- `scheduler_pick_next_ready(s)` no longer takes the CPU; the owner read
+  was its only use of it.
+
+Also: the scheduler writes the incoming thread's id to TEB+0x24
+(`ClientId.UniqueThread`, i.e. fs:[0x24]) on every switch, alongside the
+existing TLS/LastError/ExceptionList swap. All threads share one TEB, and
+it used to keep whatever the host wrote once (tew wrote 1), so guest code
+reading fs:[0x24] disagreed with GetCurrentThreadId.
+
+---
+
 ## 2026-09-27 — Add `scheduler_current_thread_id`
 
 Returns the current thread's id in one call (-1 when no thread is current).

@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
         .name = "cpu",
         .root_module = lib_mod,
         .linkage = .dynamic,
-        .version = .{ .major = 0, .minor = 2, .patch = 0 },
+        .version = .{ .major = 0, .minor = 3, .patch = 0 },
     });
     b.installArtifact(lib);
 
