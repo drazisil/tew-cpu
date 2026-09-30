@@ -4,6 +4,29 @@ Entries are newest-first.
 
 ---
 
+## 2026-09-30 — 0.3.1: x87 FPTAN/FPATAN/FXTRACT/FYL2XP1 implemented; FXAM, FPREM/FPREM1, FRNDINT, trig C2 fixed
+
+Found through MCity's HOME avatar never drawing: its projection came out
+collapsed and ~500px off-screen, and the CRT's math dispatcher (which
+classifies arguments with FXAM) took its error path on every avatar draw.
+
+- FPTAN, FPATAN, FXTRACT and FYL2XP1 were silent no-ops. FPTAN also never
+  pushed its 1.0, leaving the FPU stack off by one for everything after it.
+  FPATAN/FYL2XP1 use libc's `atan2l`/`log1pl` (Zig's std has no f80 versions).
+- FXAM cleared C3/C2/C0 for every value, so everything classified as
+  "unsupported format". It now reports empty/NaN/infinity/zero/denormal/
+  normal, with C1 = sign.
+- FPREM/FPREM1 never touched C2 or the quotient bits, and FPREM1 truncated
+  like FPREM. Both now complete the reduction (C2 = 0), set C0/C3/C1 =
+  Q2/Q1/Q0, FPREM1 rounds the quotient to nearest-even, and a zero divisor
+  or infinite dividend gives IE + NaN.
+- FSIN/FCOS/FSINCOS/FPTAN clear C2 in range and, for |x| >= 2^63, set C2
+  and leave the operand alone (stale C2 used to leak through).
+- FRNDINT honors the control word's rounding mode (was `@round`,
+  half-away-from-zero).
+- Reserved D9 register encodings (D9 D1-D7, E2, E3, E6, E7, EF) now fault as
+  unknown opcodes instead of doing nothing.
+
 ## 2026-09-29 — 0.3.0: critical sections leave the scheduler (breaking ABI)
 
 Version 0.2.0 -> 0.3.0, covering everything since 0.2.0 (this entry and the
