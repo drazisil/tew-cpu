@@ -2129,6 +2129,151 @@ test "FSCALE with a huge or NaN scale no longer panics the host" {
     try testing.expectEqual(@as(f80, 12.0), s3.fpu_stack[0]);
 }
 
+// One D9 register-form x87 op with ST0 = st0 (and ST1 = st1 when given); the
+// stack starts at top = 6 so pushes stay in bounds. Only the slots used get a
+// valid tag, like real code.
+fn runD9(modrm: u8, st0: f80, st1: ?f80) CpuState {
+    const mem = std.testing.allocator.alloc(u8, 64) catch unreachable;
+    @memset(mem, 0);
+    mem[0] = 0xD9;
+    mem[1] = modrm;
+    var s = CpuState{ .memory = mem.ptr, .memory_size = mem.len };
+    s.fpu_top = 6;
+    s.fpu_tag_word = 0xFFFF;
+    s.fpu_stack[6] = st0;
+    s.fpu_tag_word &= ~@as(u16, 3 << 12);
+    if (st1) |v| {
+        s.fpu_stack[7] = v;
+        s.fpu_tag_word &= ~@as(u16, 3 << 14);
+    }
+    cpuStep(&s);
+    return s;
+}
+fn freeD9(s: *CpuState) void {
+    std.testing.allocator.free(s.memory[0..s.memory_size]);
+}
+fn stAt(s: *const CpuState, i: u8) f80 {
+    return s.fpu_stack[(@as(u8, @truncate(s.fpu_top)) +% i) & 7];
+}
+fn cc(s: *const CpuState) u4 { // C3 C2 C1 C0
+    const w = s.fpu_status_word;
+    return @as(u4, @intFromBool(w & 0x4000 != 0)) << 3 | @as(u4, @intFromBool(w & 0x0400 != 0)) << 2 |
+        @as(u4, @intFromBool(w & 0x0200 != 0)) << 1 | @as(u4, @intFromBool(w & 0x0100 != 0));
+}
+
+test "FPTAN computes tan(ST0) and pushes 1.0 (was a silent no-op that skipped the push)" {
+    var s = runD9(0xF2, std.math.pi / 4.0, null);
+    defer freeD9(&s);
+    try testing.expect(!s.faulted);
+    try testing.expectEqual(@as(u32, 5), s.fpu_top);
+    try testing.expectEqual(@as(f80, 1.0), stAt(&s, 0));
+    try testing.expectApproxEqAbs(@as(f80, 1.0), stAt(&s, 1), 1e-15);
+    try testing.expectEqual(@as(u16, 0), s.fpu_status_word & 0x0400); // C2 = 0: in range
+
+    var big = runD9(0xF2, 1.0e19, null); // |x| >= 2^63: C2 = 1, operand untouched, no push
+    defer freeD9(&big);
+    try testing.expectEqual(@as(u32, 6), big.fpu_top);
+    try testing.expectEqual(@as(f80, 1.0e19), stAt(&big, 0));
+    try testing.expect(big.fpu_status_word & 0x0400 != 0);
+}
+
+test "FPATAN stores atan2(ST1, ST0) into ST1 and pops" {
+    var s = runD9(0xF3, -1.0, 1.0); // atan2(1, -1) = 3pi/4
+    defer freeD9(&s);
+    try testing.expectEqual(@as(u32, 7), s.fpu_top);
+    try testing.expectApproxEqAbs(@as(f80, 3.0 * std.math.pi / 4.0), stAt(&s, 0), 1e-15);
+}
+
+test "FXTRACT splits ST0 into exponent (ST1) and significand (ST0)" {
+    var s = runD9(0xF4, 12.0, null); // 12 = 1.5 * 2^3
+    defer freeD9(&s);
+    try testing.expectEqual(@as(u32, 5), s.fpu_top);
+    try testing.expectEqual(@as(f80, 1.5), stAt(&s, 0));
+    try testing.expectEqual(@as(f80, 3.0), stAt(&s, 1));
+
+    var z = runD9(0xF4, 0.0, null); // zero: exponent -inf, significand 0, ZE
+    defer freeD9(&z);
+    try testing.expect(std.math.isNegativeInf(stAt(&z, 1)));
+    try testing.expectEqual(@as(f80, 0.0), stAt(&z, 0));
+    try testing.expect(z.fpu_status_word & 0x0004 != 0);
+}
+
+test "FYL2XP1 stores ST1 * log2(ST0 + 1) and pops" {
+    var s = runD9(0xF9, 3.0, 2.0); // 2 * log2(4) = 4
+    defer freeD9(&s);
+    try testing.expectEqual(@as(u32, 7), s.fpu_top);
+    try testing.expectApproxEqAbs(@as(f80, 4.0), stAt(&s, 0), 1e-15);
+}
+
+test "FXAM reports the real class codes (was: every value 'unsupported')" {
+    const cases = [_]struct { v: f80, code: u4 }{
+        .{ .v = 1.5, .code = 0b0100 }, // normal: C2
+        .{ .v = -1.5, .code = 0b0110 }, // normal, negative: C2 C1
+        .{ .v = 0.0, .code = 0b1000 }, // zero: C3
+        .{ .v = std.math.inf(f80), .code = 0b0101 }, // infinity: C2 C0
+        .{ .v = std.math.nan(f80), .code = 0b0001 }, // NaN: C0
+        .{ .v = std.math.floatTrueMin(f80), .code = 0b1100 }, // denormal: C3 C2
+    };
+    for (cases) |c| {
+        var s = runD9(0xE5, c.v, null);
+        defer freeD9(&s);
+        try testing.expectEqual(c.code, cc(&s));
+    }
+    // An empty ST0 (tag 11): C3 C0.
+    var e = runD9(0xE5, 1.0, null);
+    defer freeD9(&e);
+    e.eip = 0;
+    e.fpu_tag_word = 0xFFFF;
+    cpuStep(&e);
+    try testing.expectEqual(@as(u4, 0b1001), cc(&e) & 0b1101);
+}
+
+test "FPREM is C fmod with C2 = 0 and the quotient bits; FPREM1 rounds the quotient to nearest" {
+    var s = runD9(0xF8, 7.0, 2.0); // fmod(7, 2) = 1, q = 3 (Q0=1, Q1=1, Q2=0)
+    defer freeD9(&s);
+    try testing.expectEqual(@as(f80, 1.0), stAt(&s, 0));
+    try testing.expectEqual(@as(u4, 0b1010), cc(&s)); // C3=Q1, C2=0, C1=Q0, C0=Q2
+    var n = runD9(0xF8, -7.5, 2.0); // sign follows the dividend
+    defer freeD9(&n);
+    try testing.expectEqual(@as(f80, -1.5), stAt(&n, 0));
+
+    var r1 = runD9(0xF5, 7.0, 2.0); // IEEE: 7/2 = 3.5 -> q = 4 (even), r = -1
+    defer freeD9(&r1);
+    try testing.expectEqual(@as(f80, -1.0), stAt(&r1, 0));
+    try testing.expectEqual(@as(u4, 0b0001), cc(&r1)); // q = 4: Q2 only -> C0
+    var r2 = runD9(0xF5, 5.0, 3.0); // 5/3 -> q = 2, r = -1
+    defer freeD9(&r2);
+    try testing.expectEqual(@as(f80, -1.0), stAt(&r2, 0));
+
+    var z = runD9(0xF8, 1.0, 0.0); // divisor 0: IE and NaN
+    defer freeD9(&z);
+    try testing.expect(std.math.isNan(stAt(&z, 0)));
+    try testing.expect(z.fpu_status_word & 0x0001 != 0);
+}
+
+test "FSIN/FCOS clear C2 in range; FRNDINT honors the rounding control" {
+    var s = runD9(0xFE, 0.5, null);
+    defer freeD9(&s);
+    s.fpu_status_word |= 0x0400; // stale C2 must be cleared by the next FSIN
+    s.eip = 0;
+    s.fpu_stack[6] = 0.5;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u16, 0), s.fpu_status_word & 0x0400);
+    try testing.expectApproxEqAbs(@sin(@as(f80, 0.5)), stAt(&s, 0), 1e-15);
+
+    var r = runD9(0xFC, 2.5, null); // default RC nearest-even: 2.5 -> 2 (was @round -> 3)
+    defer freeD9(&r);
+    try testing.expectEqual(@as(f80, 2.0), stAt(&r, 0));
+}
+
+test "reserved D9 register encodings fault loudly instead of doing nothing" {
+    for ([_]u8{ 0xD1, 0xE2, 0xE3, 0xE6, 0xE7, 0xEF }) |m| {
+        var s = runD9(m, 1.0, null);
+        defer freeD9(&s);
+        try testing.expect(s.unknown_opcode);
+    }
+}
+
 test "popping x87 handlers do not leak entries on the HOST x87 stack (discarded f80 return regression)" {
     // Found 2026-09-18 as the root cause of the two-week "FMUL returns NaN on one
     // call in many" mystery (the game's screen.c(475) assert): fpuPop() returned an

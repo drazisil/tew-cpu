@@ -141,6 +141,101 @@ fn fpuComi(s: *CpuState, a: f80, b: f80, do_pop: bool) void {
     if (do_pop) fpuDrop(s);
 }
 
+// ─── D9 register-form helpers: FXAM, FPREM/FPREM1, range-checked trig ────────
+// Found 2026-09-30 (MCity HOME avatar never drawing): FPTAN/FPATAN/FXTRACT/
+// FYL2XP1 were silent no-ops (FPTAN also skipped its push, unbalancing the
+// stack), FXAM cleared C3/C2/C0 so every value classified as "unsupported",
+// and FPREM/FPREM1 never touched C2 or the quotient bits. The CRT's math
+// dispatcher classifies its arguments with FXAM.
+
+// Zig's std has no f80 atan2/log1p; the library links libc, whose long-double
+// versions are the full 80-bit x87 format on x86-64.
+extern fn atan2l(y: c_longdouble, x: c_longdouble) c_longdouble;
+extern fn log1pl(x: c_longdouble) c_longdouble;
+
+inline fn stTagEmpty(s: *CpuState, i: u8) bool {
+    const idx: u8 = (@as(u8, @truncate(s.fpu_top)) +% i) & 7;
+    return ((s.fpu_tag_word >> @as(u4, @truncate(idx * 2))) & 3) == 3;
+}
+
+// FXAM class codes in C3/C2/C0; C1 = sign.
+fn fxam(s: *CpuState) void {
+    const x = fpuGet(s, 0);
+    s.fpu_status_word &= ~@as(u16, 0x0200);
+    if (std.math.signbit(x)) s.fpu_status_word |= 0x0200;
+    if (stTagEmpty(s, 0)) return fpuSetCC(s, true, false, true); // empty: 101
+    if (std.math.isNan(x)) return fpuSetCC(s, false, false, true); // NaN: 001
+    if (std.math.isInf(x)) return fpuSetCC(s, false, true, true); // infinity: 011
+    if (x == 0) return fpuSetCC(s, true, false, false); // zero: 100
+    if (!std.math.isNormal(x)) return fpuSetCC(s, true, true, false); // denormal: 110
+    fpuSetCC(s, false, true, false); // normal: 010
+}
+
+// FPREM (truncating quotient, like C fmod) and FPREM1 (IEEE round-to-nearest-
+// even quotient). The reduction is always completed in one step, so C2 = 0;
+// C0/C3/C1 get the quotient's low three bits (Q2/Q1/Q0). The remainder itself
+// is exact (@rem); the quotient bits are exact while |ST0/ST1| < 2^64, which is
+// the range where hardware also completes the reduction in one step.
+fn fprem(s: *CpuState, ieee: bool) void {
+    const x = fpuGet(s, 0);
+    const y = fpuGet(s, 1);
+    if (std.math.isNan(x) or std.math.isNan(y) or std.math.isInf(x) or y == 0) {
+        s.fpu_status_word |= 0x0001; // IE; result is the default NaN
+        fpuSet(s, 0, std.math.nan(f80));
+        return fpuSetCC(s, false, false, false);
+    }
+    if (std.math.isInf(y)) { // x unchanged, quotient 0
+        s.fpu_status_word &= ~@as(u16, 0x0200);
+        return fpuSetCC(s, false, false, false);
+    }
+    var r = @rem(x, y);
+    const qf = @abs(@round((x - r) / y));
+    var q: u64 = if (qf < 18446744073709551616.0) @intFromFloat(qf) else 0;
+    if (ieee) {
+        const ay = @abs(y);
+        const ar = @abs(r);
+        const half = ay / 2;
+        if (ar > half or (ar == half and (q & 1) == 1)) {
+            r = if (r > 0) r - ay else r + ay;
+            q +%= 1;
+        }
+    }
+    fpuSet(s, 0, r);
+    s.fpu_status_word &= ~@as(u16, 0x0200);
+    if ((q & 1) != 0) s.fpu_status_word |= 0x0200; // C1 = Q0
+    fpuSetCC(s, (q & 2) != 0, false, (q & 4) != 0); // C3 = Q1, C0 = Q2
+}
+
+// FSIN/FCOS/FSINCOS/FPTAN accept |x| < 2^63. Out of range: C2 = 1 and the
+// operand is left unchanged (software then reduces with FPREM and retries).
+fn trigInRange(s: *CpuState, x: f80) bool {
+    if (!std.math.isNan(x) and @abs(x) >= 9223372036854775808.0) {
+        s.fpu_status_word |= 0x0400;
+        return false;
+    }
+    s.fpu_status_word &= ~@as(u16, 0x0400);
+    return true;
+}
+
+// FXTRACT: ST0 = x -> ST1 = unbiased exponent, ST0 = significand in [1,2).
+fn fxtract(s: *CpuState) void {
+    const x = fpuGet(s, 0);
+    if (x == 0) {
+        s.fpu_status_word |= 0x0004; // ZE
+        fpuSet(s, 0, -std.math.inf(f80));
+        fpuPush(s, x);
+        return;
+    }
+    if (std.math.isNan(x) or std.math.isInf(x)) {
+        fpuSet(s, 0, if (std.math.isNan(x)) x else std.math.inf(f80));
+        fpuPush(s, x);
+        return;
+    }
+    const fr = std.math.frexp(x); // x = m * 2^e, |m| in [0.5, 1)
+    fpuSet(s, 0, @as(f80, @floatFromInt(fr.exponent - 1)));
+    fpuPush(s, fr.significand * 2);
+}
+
 // ─── Float memory I/O ─────────────────────────────────────────────────────────
 fn readFloat(s: *CpuState, addr: u32) f32 { return @bitCast(core.memRead32(s, addr)); }
 fn writeFloat(s: *CpuState, addr: u32, v: f32) void { core.memWrite32(s, addr, @bitCast(v)); }
@@ -200,38 +295,42 @@ pub fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
         switch (d.reg) {
             0 => fpuPush(s, fpuGet(s, d.rm)),  // FLD ST(i)
             1 => { const t = fpuGet(s, 0); fpuSet(s, 0, fpuGet(s, d.rm)); fpuSet(s, d.rm, t); },  // FXCH
-            2 => {},  // FNOP
+            2 => if (d.rm == 0) {} else core.opFault(s),  // FNOP; D9 D1-D7 reserved
             3 => { fpuSet(s, d.rm, fpuGet(s, 0)); fpuDrop(s); },  // FSTP ST(i)
             4 => switch (d.rm) {
                 0 => fpuSet(s, 0, -fpuGet(s, 0)),  // FCHS
                 1 => fpuSet(s, 0, @abs(fpuGet(s, 0))),  // FABS
                 4 => fpuCompare(s, fpuGet(s, 0), 0.0),  // FTST
-                5 => { s.fpu_status_word &= ~@as(u16, 0x4700); if (fpuGet(s, 0) < 0) s.fpu_status_word |= 0x0200; },  // FXAM
-                else => {},
+                5 => fxam(s),  // FXAM
+                else => core.opFault(s),  // D9 E2/E3/E6/E7 reserved
             },
-            5 => if (d.rm < 7) fpuPush(s, FPU_CONSTS[d.rm]),  // FLD constants
+            5 => if (d.rm < 7) fpuPush(s, FPU_CONSTS[d.rm]) else core.opFault(s),  // FLD constants; D9 EF reserved
             6 => switch (d.rm) {
                 0 => fpuSet(s, 0, std.math.exp2(fpuGet(s, 0)) - 1.0),  // F2XM1
                 1 => { const x = fpuGet(s, 0); const y = fpuGet(s, 1); fpuDrop(s); fpuSet(s, 0, y * std.math.log2(x)); },  // FYL2X
-                5 => { fpuSet(s, 0, @rem(fpuGet(s, 0), fpuGet(s, 1))); s.fpu_status_word &= ~@as(u16, 0x0400); },  // FPREM1
+                2 => { const v = fpuGet(s, 0); if (trigInRange(s, v)) { fpuSet(s, 0, @tan(v)); fpuPush(s, 1.0); } },  // FPTAN
+                3 => { const x = fpuGet(s, 0); const y = fpuGet(s, 1); fpuDrop(s); fpuSet(s, 0, atan2l(y, x)); },  // FPATAN: ST1 = atan2(ST1, ST0), pop
+                4 => fxtract(s),  // FXTRACT
+                5 => fprem(s, true),  // FPREM1
                 6 => { s.fpu_top = (s.fpu_top -% 1) & 7; s.fpu_status_word = (s.fpu_status_word & ~@as(u16,0x3800)) | @as(u16, @truncate((s.fpu_top & 7) << 11)); },  // FDECSTP
                 7 => { s.fpu_top = (s.fpu_top +% 1) & 7; s.fpu_status_word = (s.fpu_status_word & ~@as(u16,0x3800)) | @as(u16, @truncate((s.fpu_top & 7) << 11)); },  // FINCSTP
-                else => {},
+                else => unreachable, // rm is 3 bits
             },
             7 => switch (d.rm) {
-                0 => fpuSet(s, 0, @rem(fpuGet(s, 0), fpuGet(s, 1))),  // FPREM
+                0 => fprem(s, false),  // FPREM
+                1 => { const x = fpuGet(s, 0); const y = fpuGet(s, 1); fpuDrop(s); fpuSet(s, 0, y * (log1pl(x) / std.math.ln2)); },  // FYL2XP1: ST1 = ST1 * log2(ST0 + 1), pop
                 2 => fpuSet(s, 0, @sqrt(fpuGet(s, 0))),  // FSQRT
-                3 => { const v = fpuGet(s, 0); fpuSet(s, 0, @sin(v)); fpuPush(s, @cos(v)); },  // FSINCOS
-                4 => fpuSet(s, 0, @round(fpuGet(s, 0))),  // FRNDINT
+                3 => { const v = fpuGet(s, 0); if (trigInRange(s, v)) { fpuSet(s, 0, @sin(v)); fpuPush(s, @cos(v)); } },  // FSINCOS
+                4 => fpuSet(s, 0, roundToIntegral(fpuGet(s, 0), roundModeFromCw(s.fpu_control_word))),  // FRNDINT (honors RC, default nearest-even)
                 5 => { // FSCALE: ST0 *= 2^trunc(ST1). Stays in f80 (no @intFromFloat, which panics the host on NaN/Inf/huge ST1); the clamp only bounds exp2 -- 2^+-20000 already over/underflows f80.
                     const t = @trunc(fpuGet(s, 1));
                     const st0 = fpuGet(s, 0);
                     if (std.math.isNan(t)) fpuSet(s, 0, t)
                     else if (st0 != 0 and !std.math.isInf(st0)) fpuSet(s, 0, st0 * std.math.exp2(std.math.clamp(t, @as(f80, -20000), @as(f80, 20000))));
                 },
-                6 => fpuSet(s, 0, @sin(fpuGet(s, 0))),  // FSIN
-                7 => fpuSet(s, 0, @cos(fpuGet(s, 0))),  // FCOS
-                else => {},
+                6 => { const v = fpuGet(s, 0); if (trigInRange(s, v)) fpuSet(s, 0, @sin(v)); },  // FSIN
+                7 => { const v = fpuGet(s, 0); if (trigInRange(s, v)) fpuSet(s, 0, @cos(v)); },  // FCOS
+                else => unreachable, // rm is 3 bits
             },
             else => {},
         }
