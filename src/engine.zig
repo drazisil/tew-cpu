@@ -2549,3 +2549,160 @@ test "POP rm32 memory operand (0x8F): real Windows SEH epilogue shape, `pop dwor
     try testing.expectEqual(@as(u8, 0xCA), mem[0x303]);
 }
 
+
+// FSTP m80 / FLD m80 must use the real x87 extended layout (64-bit mantissa
+// with explicit integer bit, then a 16-bit sign+exponent word). The MSVC CRT
+// spills temporaries as `fstp tbyte` / `fld tbyte`, so a store that isn't the
+// inverse of the load turns every spilled value into ~0.
+fn runFstpM80(val: f80, mem: *[64]u8) void {
+    mem.* = [_]u8{ 0xDB, 0x3D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58; // fstp tbyte [0x20]
+    var s = CpuState{ .memory = mem, .memory_size = mem.len };
+    s.fpu_top = 0;
+    s.fpu_stack[0] = val;
+    cpuStep(&s);
+}
+
+fn runFldM80(bytes: [10]u8) f80 {
+    var mem = [_]u8{ 0xDB, 0x2D, 0x20, 0, 0, 0 } ++ [_]u8{0} ** 58; // fld tbyte [0x20]
+    @memcpy(mem[0x20..0x2A], &bytes);
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.fpu_top = 0;
+    cpuStep(&s);
+    return s.fpu_stack[s.fpu_top];
+}
+
+test "FSTP m80 writes the x87 extended-precision layout" {
+    var mem: [64]u8 = undefined;
+    runFstpM80(1.5, &mem);
+    // mantissa 0xC000000000000000 (little-endian), sign/exponent 0x3FFF
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0x3F }, mem[0x20..0x2A]);
+    runFstpM80(-2.0, &mem);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0x80, 0x00, 0xC0 }, mem[0x20..0x2A]);
+}
+
+test "FLD m80 decodes the x87 extended-precision layout exactly" {
+    try testing.expectEqual(@as(f80, 1.5), runFldM80(.{ 0, 0, 0, 0, 0, 0, 0, 0xC0, 0xFF, 0x3F }));
+    try testing.expectEqual(@as(f80, -2.0), runFldM80(.{ 0, 0, 0, 0, 0, 0, 0, 0x80, 0x00, 0xC0 }));
+    try testing.expectEqual(@as(f80, 0.0), runFldM80(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
+}
+
+test "FSTP m80 then FLD m80 round-trips values including ones a double can't hold" {
+    var mem: [64]u8 = undefined;
+    const vals = [_]f80{ 0.1, 3.14159265358979323846, 1.0e300, 1.0e-300, 123456.789, 1.0 + 1.0 / 4503599627370496.0 / 1024.0 };
+    for (vals) |v| {
+        runFstpM80(v, &mem);
+        try testing.expectEqual(v, runFldM80(mem[0x20..0x2A].*));
+    }
+}
+
+// ── x87 register-form audit (2026-10-02) ─────────────────────────────────────
+// Runs `code` with ST(0)=st0, ST(1)=st1 loaded; returns the CPU state.
+fn runX87(code: []const u8, st0: f80, st1: f80, mem: *[64]u8) CpuState {
+    @memset(mem, 0);
+    @memcpy(mem[0..code.len], code);
+    var s = CpuState{ .memory = mem, .memory_size = mem.len };
+    s.fpu_top = 0;
+    s.fpu_stack[0] = st0;
+    s.fpu_stack[1] = st1;
+    cpuStep(&s);
+    return s;
+}
+
+test "DC E0+i..F8+i register forms follow the SDM operand order (same as DE without the pop)" {
+    var mem: [64]u8 = undefined;
+    // st0 = 5, st1 = 3, destination is ST(1)
+    var s = runX87(&.{ 0xDC, 0xE1 }, 5.0, 3.0, &mem); // FSUBR ST(1),ST: st1 = st0 - st1
+    try testing.expectEqual(@as(f80, 2.0), s.fpu_stack[1]);
+    s = runX87(&.{ 0xDC, 0xE9 }, 5.0, 3.0, &mem); // FSUB ST(1),ST: st1 = st1 - st0
+    try testing.expectEqual(@as(f80, -2.0), s.fpu_stack[1]);
+    s = runX87(&.{ 0xDC, 0xF1 }, 6.0, 3.0, &mem); // FDIVR ST(1),ST: st1 = st0 / st1
+    try testing.expectEqual(@as(f80, 2.0), s.fpu_stack[1]);
+    s = runX87(&.{ 0xDC, 0xF9 }, 6.0, 3.0, &mem); // FDIV ST(1),ST: st1 = st1 / st0
+    try testing.expectEqual(@as(f80, 0.5), s.fpu_stack[1]);
+}
+
+test "DE E0+i..F8+i popping forms agree with the DC forms" {
+    var mem: [64]u8 = undefined;
+    // after the pop the result sits in ST(0)
+    var s = runX87(&.{ 0xDE, 0xE1 }, 5.0, 3.0, &mem); // FSUBRP: st1 = st0 - st1
+    try testing.expectEqual(@as(f80, 2.0), s.fpu_stack[s.fpu_top]);
+    s = runX87(&.{ 0xDE, 0xE9 }, 5.0, 3.0, &mem); // FSUBP: st1 = st1 - st0
+    try testing.expectEqual(@as(f80, -2.0), s.fpu_stack[s.fpu_top]);
+    s = runX87(&.{ 0xDE, 0xF1 }, 6.0, 3.0, &mem); // FDIVRP
+    try testing.expectEqual(@as(f80, 2.0), s.fpu_stack[s.fpu_top]);
+    s = runX87(&.{ 0xDE, 0xF9 }, 6.0, 3.0, &mem); // FDIVP
+    try testing.expectEqual(@as(f80, 0.5), s.fpu_stack[s.fpu_top]);
+}
+
+test "DC C0 FADD ST(0),ST(0) doubles ST(0)" {
+    var mem: [64]u8 = undefined;
+    const s = runX87(&.{ 0xDC, 0xC0 }, 1.5, 0.0, &mem);
+    try testing.expectEqual(@as(f80, 3.0), s.fpu_stack[0]);
+}
+
+fn runX87Flags(code: []const u8, st0: f80, st1: f80, cf: bool, zf: bool, pf: bool, mem: *[64]u8) CpuState {
+    @memset(mem, 0);
+    @memcpy(mem[0..code.len], code);
+    var s = CpuState{ .memory = mem, .memory_size = mem.len };
+    s.fpu_top = 0;
+    s.fpu_stack[0] = st0;
+    s.fpu_stack[1] = st1;
+    setFlag(&s, CF_BIT, cf);
+    setFlag(&s, ZF_BIT, zf);
+    setFlag(&s, PF_BIT, pf);
+    cpuStep(&s);
+    return s;
+}
+
+test "FCMOVcc: DA = B/E/BE/U, DB = NB/NE/NBE/NU, each tests the right flags" {
+    var mem: [64]u8 = undefined;
+    // FCMOVB (DA C1) copies ST(1) to ST(0) only when CF
+    try testing.expectEqual(@as(f80, 9.0), runX87Flags(&.{ 0xDA, 0xC1 }, 1.0, 9.0, true, false, false, &mem).fpu_stack[0]);
+    try testing.expectEqual(@as(f80, 1.0), runX87Flags(&.{ 0xDA, 0xC1 }, 1.0, 9.0, false, false, false, &mem).fpu_stack[0]);
+    // FCMOVU (DA D9) only when PF
+    try testing.expectEqual(@as(f80, 9.0), runX87Flags(&.{ 0xDA, 0xD9 }, 1.0, 9.0, false, false, true, &mem).fpu_stack[0]);
+    try testing.expectEqual(@as(f80, 1.0), runX87Flags(&.{ 0xDA, 0xD9 }, 1.0, 9.0, false, false, false, &mem).fpu_stack[0]);
+    // FCMOVNB (DB C1) when !CF
+    try testing.expectEqual(@as(f80, 9.0), runX87Flags(&.{ 0xDB, 0xC1 }, 1.0, 9.0, false, false, false, &mem).fpu_stack[0]);
+    try testing.expectEqual(@as(f80, 1.0), runX87Flags(&.{ 0xDB, 0xC1 }, 1.0, 9.0, true, false, false, &mem).fpu_stack[0]);
+    // FCMOVNE (DB C9) when !ZF
+    try testing.expectEqual(@as(f80, 9.0), runX87Flags(&.{ 0xDB, 0xC9 }, 1.0, 9.0, false, false, false, &mem).fpu_stack[0]);
+    try testing.expectEqual(@as(f80, 1.0), runX87Flags(&.{ 0xDB, 0xC9 }, 1.0, 9.0, false, true, false, &mem).fpu_stack[0]);
+    // FCMOVNBE (DB D1) when !CF && !ZF
+    try testing.expectEqual(@as(f80, 9.0), runX87Flags(&.{ 0xDB, 0xD1 }, 1.0, 9.0, false, false, false, &mem).fpu_stack[0]);
+    try testing.expectEqual(@as(f80, 1.0), runX87Flags(&.{ 0xDB, 0xD1 }, 1.0, 9.0, true, false, false, &mem).fpu_stack[0]);
+    try testing.expectEqual(@as(f80, 1.0), runX87Flags(&.{ 0xDB, 0xD1 }, 1.0, 9.0, false, true, false, &mem).fpu_stack[0]);
+    // FCMOVNU (DB D9) when !PF
+    try testing.expectEqual(@as(f80, 9.0), runX87Flags(&.{ 0xDB, 0xD9 }, 1.0, 9.0, false, false, false, &mem).fpu_stack[0]);
+    try testing.expectEqual(@as(f80, 1.0), runX87Flags(&.{ 0xDB, 0xD9 }, 1.0, 9.0, false, false, true, &mem).fpu_stack[0]);
+}
+
+test "FCOMI sets ZF/PF/CF: unordered = 111, greater = 000, less = CF, equal = ZF" {
+    var mem: [64]u8 = undefined;
+    const nan = std.math.nan(f80);
+    var s = runX87Flags(&.{ 0xDB, 0xF1 }, nan, 1.0, false, false, false, &mem); // FCOMI ST,ST(1)
+    try testing.expect(getFlag(&s, ZF_BIT) and getFlag(&s, PF_BIT) and getFlag(&s, CF_BIT));
+    s = runX87Flags(&.{ 0xDB, 0xF1 }, 2.0, 1.0, true, true, true, &mem);
+    try testing.expect(!getFlag(&s, ZF_BIT) and !getFlag(&s, PF_BIT) and !getFlag(&s, CF_BIT));
+    s = runX87Flags(&.{ 0xDB, 0xF1 }, 1.0, 2.0, false, true, true, &mem);
+    try testing.expect(!getFlag(&s, ZF_BIT) and !getFlag(&s, PF_BIT) and getFlag(&s, CF_BIT));
+    s = runX87Flags(&.{ 0xDB, 0xF1 }, 2.0, 2.0, true, false, true, &mem);
+    try testing.expect(getFlag(&s, ZF_BIT) and !getFlag(&s, PF_BIT) and !getFlag(&s, CF_BIT));
+}
+
+test "unimplemented x87 state/BCD ops fault loudly instead of being silent NOPs" {
+    var mem: [64]u8 = undefined;
+    // modrm 0x25 = mod 00, reg 4, rm 101 (disp32); /4 and /6 variants
+    const cases = [_][]const u8{
+        &.{ 0xD9, 0x25, 0x20, 0, 0, 0 }, // FLDENV
+        &.{ 0xD9, 0x35, 0x20, 0, 0, 0 }, // FNSTENV
+        &.{ 0xDD, 0x25, 0x20, 0, 0, 0 }, // FRSTOR
+        &.{ 0xDD, 0x35, 0x20, 0, 0, 0 }, // FNSAVE
+        &.{ 0xDF, 0x25, 0x20, 0, 0, 0 }, // FBLD
+        &.{ 0xDF, 0x35, 0x20, 0, 0, 0 }, // FBSTP
+    };
+    for (cases) |c| {
+        const s = runX87(c, 1.0, 2.0, &mem);
+        try testing.expect(s.faulted and s.halted and s.unknown_opcode);
+    }
+}

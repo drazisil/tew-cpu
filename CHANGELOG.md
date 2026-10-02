@@ -4,6 +4,26 @@ Entries are newest-first.
 
 ---
 
+## 2026-10-02 — 0.3.2: x87 operand-order and flag fixes; silent no-ops now fault
+
+Found while chasing why MCity's RunEngSim writes no output (audit of the x87
+handlers; this is not yet known to be the cause).
+
+- FSTP m80 wrote a 64-bit double plus a zero exponent word; FLD m80 read the
+  real extended layout, so any `fstp tbyte`/`fld tbyte` round trip (CRT
+  temporaries) came back as ~0. Both now use the f80 bit layout.
+- DC E0..FF register forms (FSUBR/FSUB/FDIVR/FDIV ST(i),ST) had their operands
+  swapped relative to the SDM and to the DE popping forms.
+- FCMOVNB/NE/NBE/NU (DB C0..DF) were not implemented (silent no-op); FCMOVU
+  (DA D8..DF) copied unconditionally instead of testing PF.
+- FCOMI/FUCOMI/FCOMIP/FUCOMIP never set PF; unordered now sets ZF=PF=CF=1.
+- New opt-in `cpu_trace_start`/`cpu_trace_stop`: records each executed
+  instruction's EIP into a host-owned ring buffer (off unless started).
+- FLDENV, FNSTENV, FRSTOR, FNSAVE, FBLD and FBSTP were silent NOPs; they now
+  fault as unknown opcodes (fail loudly) until implemented.
+
+---
+
 ## 2026-09-30 — 0.3.1: x87 FPTAN/FPATAN/FXTRACT/FYL2XP1 implemented; FXAM, FPREM/FPREM1, FRNDINT, trig C2 fixed
 
 Found through MCity's HOME avatar never drawing: its projection came out

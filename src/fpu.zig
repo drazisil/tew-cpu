@@ -128,14 +128,15 @@ fn fpuCompare(s: *CpuState, a: f80, b: f80) void {
     }
 }
 fn fpuComi(s: *CpuState, a: f80, b: f80, do_pop: bool) void {
+    // Unordered sets ZF=PF=CF=1; otherwise PF=0 (so `jp` after FCOMI works).
     if (std.math.isNan(a) or std.math.isNan(b)) {
-        core.setFlag(s, core.ZF_BIT, true); core.setFlag(s, core.CF_BIT, true);
+        core.setFlag(s, core.ZF_BIT, true); core.setFlag(s, core.PF_BIT, true); core.setFlag(s, core.CF_BIT, true);
     } else if (a > b) {
-        core.setFlag(s, core.ZF_BIT, false); core.setFlag(s, core.CF_BIT, false);
+        core.setFlag(s, core.ZF_BIT, false); core.setFlag(s, core.PF_BIT, false); core.setFlag(s, core.CF_BIT, false);
     } else if (a < b) {
-        core.setFlag(s, core.ZF_BIT, false); core.setFlag(s, core.CF_BIT, true);
+        core.setFlag(s, core.ZF_BIT, false); core.setFlag(s, core.PF_BIT, false); core.setFlag(s, core.CF_BIT, true);
     } else {
-        core.setFlag(s, core.ZF_BIT, true); core.setFlag(s, core.CF_BIT, false);
+        core.setFlag(s, core.ZF_BIT, true); core.setFlag(s, core.PF_BIT, false); core.setFlag(s, core.CF_BIT, false);
     }
     core.setFlag(s, core.OF_BIT, false);
     if (do_pop) fpuDrop(s);
@@ -340,9 +341,9 @@ pub fn opD9(s: *CpuState) void { // FLD/FST/FSTP/constants/misc
             0 => fpuPush(s, readFloat(s, addr)),  // FLD m32
             2 => writeFloat(s, addr, @floatCast(fpuGet(s, 0))),  // FST m32
             3 => { writeFloat(s, addr, @floatCast(fpuGet(s, 0))); fpuDrop(s); },  // FSTP m32
-            4 => {},  // FLDENV NOP
+            4 => core.opFault(s),  // FLDENV: not implemented -- fail loudly, not a silent NOP
             5 => s.fpu_control_word = core.memRead16(s, addr),  // FLDCW
-            6 => {},  // FNSTENV NOP
+            6 => core.opFault(s),  // FNSTENV: not implemented -- fail loudly, not a silent NOP
             7 => core.memWrite16(s, addr, s.fpu_control_word),  // FNSTCW
             else => {},
         }
@@ -357,7 +358,7 @@ pub fn opDA(s: *CpuState) void { // int32 ops / FCMOV
             0 => { if (core.getFlag(s, core.CF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVB
             1 => { if (core.getFlag(s, core.ZF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVE
             2 => { if (core.getFlag(s, core.CF_BIT) or core.getFlag(s, core.ZF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVBE
-            3 => fpuSet(s, 0, fpuGet(s, d.rm)),  // FCMOVU
+            3 => { if (core.getFlag(s, core.PF_BIT)) fpuSet(s, 0, fpuGet(s, d.rm)); },  // FCMOVU
             5 => if (d.rm == 1) { fpuCompare(s, fpuGet(s, 0), fpuGet(s, 1)); fpuDrop(s); fpuDrop(s); },  // FUCOMPP
             else => {},
         }
@@ -378,7 +379,11 @@ pub fn opDB(s: *CpuState) void { // FILD/FISTP int32, FCLEX/FINIT, FUCOMI
     core.hostFpuCheck(s);
     const d = core.decodeModRM(s);
     if (d.mod == 3) {
-        if (d.reg == 4) {
+        if (d.reg < 4) { // FCMOVNB / FCMOVNE / FCMOVNBE / FCMOVNU
+            const cf = core.getFlag(s, core.CF_BIT); const zf = core.getFlag(s, core.ZF_BIT); const pf = core.getFlag(s, core.PF_BIT);
+            const take = switch (d.reg) { 0 => !cf, 1 => !zf, 2 => !cf and !zf, else => !pf };
+            if (take) fpuSet(s, 0, fpuGet(s, d.rm));
+        } else if (d.reg == 4) {
             if (d.rm == 2) { s.fpu_status_word &= 0x7F00; }  // FCLEX
             else if (d.rm == 3) { s.fpu_control_word = 0x037F; s.fpu_status_word = 0; s.fpu_tag_word = 0xFFFF; s.fpu_top = 0; }  // FINIT
         } else if (d.reg == 5) fpuComi(s, fpuGet(s, 0), fpuGet(s, d.rm), false)  // FUCOMI
@@ -390,15 +395,17 @@ pub fn opDB(s: *CpuState) void { // FILD/FISTP int32, FCLEX/FINIT, FUCOMI
             1 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), .truncate))); fpuDrop(s); },  // FISTTP
             2 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); },  // FIST
             3 => { core.memWrite32(s, addr, @bitCast(fistConvert(i32, s, fpuGet(s, 0), roundModeFromCw(s.fpu_control_word)))); fpuDrop(s); },  // FISTP
-            5 => { // FLD m80real
-                const lo = core.memRead32(s, addr); const hi = core.memRead32(s, addr + 4); const exp = core.memRead16(s, addr + 8);
-                const sign: f80 = if ((exp & 0x8000) != 0) -1.0 else 1.0;
-                const e: i32 = @as(i32, exp & 0x7FFF) - 16383;
-                const mant: f80 = (@as(f80, @floatFromInt(@as(u64, hi))) * 4294967296.0 + @as(f80, @floatFromInt(lo))) / 9223372036854775808.0;
-                if (e == -16383 and lo == 0 and hi == 0) fpuPush(s, sign * 0.0)
-                else fpuPush(s, sign * @as(f80, @floatCast(std.math.pow(f64, 2.0, @as(f64, @floatFromInt(e))))) * mant);
+            5 => { // FLD m80real: Zig's f80 has the x87 extended layout, so the 10 bytes are the value's bits
+                const bits: u80 = (@as(u80, core.memRead16(s, addr + 8)) << 64) | (@as(u80, core.memRead32(s, addr + 4)) << 32) | @as(u80, core.memRead32(s, addr));
+                fpuPush(s, @bitCast(bits));
             },
-            7 => { writeDouble(s, addr, @floatCast(fpuGet(s, 0))); core.memWrite16(s, addr + 8, 0); fpuDrop(s); },  // FSTP m80
+            7 => { // FSTP m80real
+                const bits: u80 = @bitCast(fpuGet(s, 0));
+                core.memWrite32(s, addr, @truncate(bits));
+                core.memWrite32(s, addr + 4, @truncate(bits >> 32));
+                core.memWrite16(s, addr + 8, @truncate(bits >> 64));
+                fpuDrop(s);
+            },
             else => {},
         }
     }
@@ -412,8 +419,9 @@ pub fn opDC(s: *CpuState) void { // float64 ops (reversed operands)
         switch (d.reg) {
             0 => fpuSet(s, d.rm, sti + st0), 1 => fpuSet(s, d.rm, sti * st0),
             2 => fpuCompare(s, st0, sti), 3 => { fpuCompare(s, st0, sti); fpuDrop(s); },
-            4 => fpuSet(s, d.rm, sti - st0), 5 => fpuSet(s, d.rm, st0 - sti),
-            6 => fpuSet(s, d.rm, sti / st0), 7 => fpuSet(s, d.rm, st0 / sti),
+            // DC E0+i FSUBR / E8+i FSUB / F0+i FDIVR / F8+i FDIV (ST(i) is the destination)
+            4 => fpuSet(s, d.rm, st0 - sti), 5 => fpuSet(s, d.rm, sti - st0),
+            6 => fpuSet(s, d.rm, st0 / sti), 7 => fpuSet(s, d.rm, sti / st0),
             else => {},
         }
     } else {
@@ -448,7 +456,7 @@ pub fn opDD(s: *CpuState) void { // FLD/FST/FSTP float64, FUCOM
             1 => { writeDouble(s, addr, @floatCast(@trunc(fpuGet(s, 0)))); fpuDrop(s); },  // FISTTP m64
             2 => writeDouble(s, addr, @floatCast(fpuGet(s, 0))),  // FST m64
             3 => { writeDouble(s, addr, @floatCast(fpuGet(s, 0))); fpuDrop(s); },  // FSTP m64
-            4, 6 => {},  // FRSTOR/FNSAVE NOP
+            4, 6 => core.opFault(s),  // FRSTOR/FNSAVE: not implemented -- fail loudly, not a silent NOP
             7 => core.memWrite16(s, addr, s.fpu_status_word),  // FNSTSW m16
             else => {},
         }
@@ -503,6 +511,7 @@ pub fn opDF(s: *CpuState) void { // FILD/FISTP int16/int64, FNSTSW AX, FUCOMIP
             // FILD m64: f80 has 64-bit mantissa — all i64 values are exact, no precision loss.
             5 => { const lo = core.memRead32(s, addr); const hi = core.memReadS32(s, addr + 4); fpuPush(s, @as(f80, @floatFromInt(@as(i64, hi) * @as(i64, 0x100000000) + @as(i64, lo)))); },  // FILD m64
             // FISTP m64: f80→i64 is exact for all representable integers.
+            4, 6 => core.opFault(s),  // FBLD / FBSTP (BCD): not implemented -- fail loudly
             7 => { const val = fpuGet(s, 0); const bits: u64 = @bitCast(fistConvert(i64, s, val, roundModeFromCw(s.fpu_control_word))); core.memWrite32(s, addr, @truncate(bits)); core.memWrite32(s, addr + 4, @truncate(bits >> 32)); fpuDrop(s); },  // FISTP m64
             else => {},
         }
