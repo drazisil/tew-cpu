@@ -168,6 +168,10 @@ pub const CpuState = struct {
     history_ctx: ?*anyopaque = null, // shared by both hooks below
     write_hook: ?WriteHookFn = null,
     step_hook: ?StepHookFn = null,
+    // Optional host-owned EIP ring buffer (cpu_trace_start/stop): records each executed instruction's EIP.
+    trace_buf: ?[*]u32 = null,
+    trace_cap: u32 = 0,
+    trace_pos: u32 = 0,
 };
 
 // Regression guard for the 2026-09 host-x87 stack leak (see fpu.zig's fpuDrop

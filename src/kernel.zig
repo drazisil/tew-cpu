@@ -104,6 +104,10 @@ pub export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
         // count greater than 1.
         const step_no = s.step_count;
         engine.cpuStep(s);
+        if (s.trace_buf) |tb| {
+            tb[s.trace_pos % s.trace_cap] = s.last_instr_eip;
+            s.trace_pos +%= 1;
+        }
         if (!s.faulted) {
             if (s.step_hook) |hook| hook(s.history_ctx, s.run_id, step_no, s.eip, &s.regs, s.eflags);
         }
@@ -111,6 +115,18 @@ pub export fn cpu_run(s: *CpuState, max_steps: u64) RunResult {
     if (s.faulted) return .faulted;
     if (s.halted) return .halted;
     return .step_limit;
+}
+/// Start recording each executed instruction's EIP into `buf` (a ring of `cap` u32s).
+export fn cpu_trace_start(s: *CpuState, buf: [*]u32, cap: u32) void {
+    if (cap == 0) return;
+    s.trace_cap = cap;
+    s.trace_pos = 0;
+    s.trace_buf = buf;
+}
+/// Stop recording; returns the total number of instructions recorded (may exceed `cap`).
+export fn cpu_trace_stop(s: *CpuState) u32 {
+    s.trace_buf = null;
+    return s.trace_pos;
 }
 export fn cpu_get_reg(s: *CpuState, idx: u32) u32 { return if (idx < 8) s.regs[idx] else 0; }
 export fn cpu_set_reg(s: *CpuState, idx: u32, val: u32) void {
