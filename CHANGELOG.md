@@ -17,6 +17,8 @@ handlers; this is not yet known to be the cause).
 - FCMOVNB/NE/NBE/NU (DB C0..DF) were not implemented (silent no-op); FCMOVU
   (DA D8..DF) copied unconditionally instead of testing PF.
 - FCOMI/FUCOMI/FCOMIP/FUCOMIP never set PF; unordered now sets ZF=PF=CF=1.
+- New opt-in `cpu_trace_start`/`cpu_trace_stop`: records each executed
+  instruction's EIP into a host-owned ring buffer (off unless started).
 - FLDENV, FNSTENV, FRSTOR, FNSAVE, FBLD and FBSTP were silent NOPs; they now
   fault as unknown opcodes (fail loudly) until implemented.
 
