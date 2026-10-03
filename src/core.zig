@@ -216,10 +216,31 @@ pub inline fn memRead8(s: *CpuState, addr: u32) u8 {
     }
     return primitives.readByte(s.memory, addr);
 }
+// Fast path for 16/32-bit accesses: when every byte is in bounds (no u32
+// wrap, no null-page guard hit) one unaligned load/store replaces `width`
+// separate byte accesses, each of which repeated the fault check. Anything
+// else -- straddling the end of memory, the null page, a watchpoint or
+// write hook inside the access -- takes the original byte-by-byte path so
+// fault, watchpoint and hook behaviour is unchanged.
+inline fn wideAccessOk(s: *const CpuState, addr: u32, comptime width: u32) bool {
+    const size32: u64 = @as(u32, @truncate(s.memory_size));
+    return @as(u64, addr) + width <= size32 and !(s.guard_null_page and addr < NULL_PAGE_SIZE);
+}
+inline fn wideWriteOk(s: *const CpuState, addr: u32, comptime width: u32) bool {
+    if (s.write_hook != null) return false;
+    if (s.watchpoint != 0 and s.watchpoint >= addr and s.watchpoint < @as(u64, addr) + width) return false;
+    return wideAccessOk(s, addr, width);
+}
 pub inline fn memRead16(s: *CpuState, addr: u32) u16 {
+    if (wideAccessOk(s, addr, 2)) {
+        return std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(s.memory + addr)), .little);
+    }
     return @as(u16, memRead8(s, addr)) | (@as(u16, memRead8(s, addr +% 1)) << 8);
 }
 pub inline fn memRead32(s: *CpuState, addr: u32) u32 {
+    if (wideAccessOk(s, addr, 4)) {
+        return std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(s.memory + addr)), .little);
+    }
     return @as(u32, memRead8(s, addr)) | (@as(u32, memRead8(s, addr +% 1)) << 8) |
         (@as(u32, memRead8(s, addr +% 2)) << 16) | (@as(u32, memRead8(s, addr +% 3)) << 24);
 }
@@ -249,10 +270,18 @@ pub inline fn memWrite8(s: *CpuState, addr: u32, v: u8) void {
     primitives.writeByte(s.memory, addr, v);
 }
 pub inline fn memWrite16(s: *CpuState, addr: u32, v: u16) void {
+    if (wideWriteOk(s, addr, 2)) {
+        std.mem.writeInt(u16, @as(*[2]u8, @ptrCast(s.memory + addr)), v, .little);
+        return;
+    }
     memWrite8(s, addr, @truncate(v));
     memWrite8(s, addr +% 1, @truncate(v >> 8));
 }
 pub inline fn memWrite32(s: *CpuState, addr: u32, v: u32) void {
+    if (wideWriteOk(s, addr, 4)) {
+        std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(s.memory + addr)), v, .little);
+        return;
+    }
     memWrite8(s, addr, @truncate(v));
     memWrite8(s, addr +% 1, @truncate(v >> 8));
     memWrite8(s, addr +% 2, @truncate(v >> 16));
@@ -594,4 +623,95 @@ pub fn opFault(s: *CpuState) void {
     s.faulted = true;
     s.halted = true;
     s.unknown_opcode = true;
+}
+
+// ─── Tests: 16/32-bit fast path behaves exactly like the byte-by-byte path ───
+const testing = std.testing;
+
+fn composeRead32(s: *CpuState, addr: u32) u32 {
+    return @as(u32, memRead8(s, addr)) | (@as(u32, memRead8(s, addr +% 1)) << 8) |
+        (@as(u32, memRead8(s, addr +% 2)) << 16) | (@as(u32, memRead8(s, addr +% 3)) << 24);
+}
+
+test "wide reads match byte composition at every alignment" {
+    var mem: [64]u8 = undefined;
+    for (&mem, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    var a: u32 = 0;
+    while (a + 4 <= mem.len) : (a += 1) {
+        try testing.expectEqual(composeRead32(&s, a), memRead32(&s, a));
+        try testing.expectEqual(@as(u16, mem[a]) | (@as(u16, mem[a + 1]) << 8), memRead16(&s, a));
+    }
+    try testing.expect(!s.faulted);
+}
+
+test "wide writes land little-endian at every alignment" {
+    var mem = [_]u8{0} ** 32;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    memWrite32(&s, 5, 0xAABBCCDD);
+    try testing.expectEqualSlices(u8, &.{ 0xDD, 0xCC, 0xBB, 0xAA }, mem[5..9]);
+    memWrite16(&s, 11, 0x1234);
+    try testing.expectEqualSlices(u8, &.{ 0x34, 0x12 }, mem[11..13]);
+    try testing.expectEqual(@as(u8, 0), mem[4]);
+    try testing.expectEqual(@as(u8, 0), mem[9]);
+}
+
+test "read straddling the end of memory keeps the in-bounds bytes and faults" {
+    var mem = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    const v = memRead32(&s, 6); // bytes 6,7 real; 8,9 out of bounds
+    try testing.expect(s.faulted);
+    try testing.expectEqual(@as(u32, 0x0807), v);
+}
+
+test "write straddling the end of memory writes the in-bounds bytes and faults" {
+    var mem = [_]u8{0} ** 8;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    memWrite32(&s, 6, 0x44332211);
+    try testing.expect(s.faulted);
+    try testing.expectEqual(@as(u8, 0x11), mem[6]);
+    try testing.expectEqual(@as(u8, 0x22), mem[7]);
+}
+
+test "address that wraps u32 is rejected, not read" {
+    var mem = [_]u8{0xAB} ** 16;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    _ = memRead32(&s, 0xFFFFFFFE);
+    try testing.expect(s.faulted);
+}
+
+test "null-page guard still faults wide accesses" {
+    var mem = [_]u8{0} ** (NULL_PAGE_SIZE + 64);
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len, .guard_null_page = true };
+    _ = memRead32(&s, 0x100);
+    try testing.expect(s.faulted);
+    s.faulted = false;
+    s.halted = false;
+    memWrite32(&s, 0x100, 1);
+    try testing.expect(s.faulted);
+    s.faulted = false;
+    _ = memRead32(&s, NULL_PAGE_SIZE + 8);
+    try testing.expect(!s.faulted);
+}
+
+test "watchpoint inside a wide write is still reported" {
+    var mem = [_]u8{0} ** 32;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len, .watchpoint = 18 };
+    memWrite32(&s, 16, 0x04030201); // watchpoint address is the third byte
+    try testing.expect(s.watchpoint_hit);
+    try testing.expect(s.halted);
+    try testing.expectEqual(@as(u8, 0x03), s.watchpoint_val);
+}
+
+var test_hook_calls: u32 = 0;
+fn testHook(_: ?*anyopaque, _: u64, _: u64, _: u32, _: u8, _: u8) callconv(.c) void {
+    test_hook_calls += 1;
+}
+
+test "write hook still fires once per changed byte on a wide write" {
+    var mem = [_]u8{ 0, 0xFF, 0, 0 } ++ [_]u8{0} ** 28;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len, .write_hook = testHook };
+    test_hook_calls = 0;
+    memWrite32(&s, 0, 0x000000FF); // byte0 0->FF (changes), byte1 FF->0 (changes), 2,3 unchanged
+    try testing.expectEqual(@as(u32, 2), test_hook_calls);
 }
