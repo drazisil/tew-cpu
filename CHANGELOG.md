@@ -4,6 +4,18 @@ Entries are newest-first.
 
 ---
 
+## 2026-10-03 — 0.3.3: 16/32-bit memory accesses take one load/store
+
+`memRead16/32` and `memWrite16/32` did a separate byte access per byte, each
+repeating the fault, watchpoint and write-hook checks. When every byte is in
+bounds (no u32 wrap, no null-page guard hit, and for writes no hook or
+watchpoint inside the access) they now do a single unaligned load or store.
+Every other case takes the original byte path, so faults, partial reads at the
+end of memory, watchpoints and write hooks behave exactly as before (new tests
+cover each). Measured on the MCity test-drive run: ~4% faster (first click
+trigger 62.7s -> 60.4s; test-drive load 70s -> 67s; single runs, so treat as
+approximate). The decode/dispatch loop is untouched.
+
 ## 2026-10-02 — 0.3.2: x87 operand-order and flag fixes; silent no-ops now fault
 
 Found while chasing why MCity's RunEngSim writes no output (audit of the x87
