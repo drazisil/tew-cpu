@@ -4,6 +4,22 @@ Entries are newest-first.
 
 ---
 
+## 2026-10-03 — 0.3.4: `rep stosd` fills in bulk
+
+A histogram over one MCity run (542s) counted 146 million `rep stosd` fills of
+0xCCCCCCCC (the MSVC debug-build frame fill): 60% are exactly 17 dwords, 97%
+are 24 dwords or fewer, and they are 99.6% of all `rep stosd` calls. They were
+filled one dword at a time with the full check set each time. When the whole
+range is in bounds (no u32 wrap, no null-page guard, no write hook, no
+watchpoint inside it) the forward and backward (DF set) cases are now one range
+check plus one bulk fill. Anything else, including a fault part-way, takes the
+original per-element loop (tests compare both across sizes, alignments, the end
+of memory, address 0, the null page, a watchpoint, and a write hook). Micro-
+benchmark: a 17-dword fill 25.1 ns -> 4.8 ns (5.2x).
+
+Also fixes 0.3.3: it bumped `build.zig.zon` but not the separate version in
+`build.zig`, so the built library still reported 0.3.2.
+
 ## 2026-10-03 — 0.3.3: 16/32-bit memory accesses take one load/store
 
 `memRead16/32` and `memWrite16/32` did a separate byte access per byte, each

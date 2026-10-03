@@ -231,6 +231,23 @@ inline fn wideWriteOk(s: *const CpuState, addr: u32, comptime width: u32) bool {
     if (s.watchpoint != 0 and s.watchpoint >= addr and s.watchpoint < @as(u64, addr) + width) return false;
     return wideAccessOk(s, addr, width);
 }
+/// Fill `count` dwords with `value` starting at byte address `low` in one
+/// bulk store, if the whole range is plainly in bounds: no u32 wrap, no
+/// null-page guard hit, no write hook, no watchpoint inside it. Returns false
+/// (having written nothing) otherwise, and the caller falls back to the
+/// per-element path so faults, partial writes, watchpoints and hooks behave
+/// exactly as before.
+pub fn fillDwordsFast(s: *CpuState, low: u64, count: u32, value: u32) bool {
+    const end: u64 = low + @as(u64, count) * 4;
+    const size32: u64 = @as(u32, @truncate(s.memory_size));
+    if (end > size32) return false;
+    if (s.guard_null_page and low < NULL_PAGE_SIZE) return false;
+    if (s.write_hook != null) return false;
+    if (s.watchpoint != 0 and s.watchpoint >= low and s.watchpoint < end) return false;
+    const dst: [*]align(1) u32 = @ptrCast(s.memory + @as(usize, @intCast(low)));
+    @memset(dst[0..count], value);
+    return true;
+}
 pub inline fn memRead16(s: *CpuState, addr: u32) u16 {
     if (wideAccessOk(s, addr, 2)) {
         return std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(s.memory + addr)), .little);
