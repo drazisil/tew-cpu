@@ -1086,6 +1086,26 @@ fn opAB(s: *CpuState) void { // STOSD/STOSW
     const step: i32 = if (wide) 4 else 2;
     const d: i32 = strDir(s) * step;
     if (s.rep_prefix == REP_REP) {
+        // Debug-build frame fills (`rep stosd` of 0xCCCCCCCC, ~17 dwords) are ~2% of
+        // all executed instructions: do the in-bounds case as one bulk fill.
+        if (wide and s.regs[ECX] != 0) {
+            const count = s.regs[ECX];
+            const edi: u64 = s.regs[EDI];
+            const span: u64 = @as(u64, count) * 4;
+            if (!getFlag(s, DF_BIT)) {
+                if (core.fillDwordsFast(s, edi, count, s.regs[EAX])) {
+                    s.regs[EDI] = @truncate(edi +% span);
+                    s.regs[ECX] = 0;
+                    return;
+                }
+            } else if (edi + 4 >= span) { // backward: lowest element is edi - 4*(count-1)
+                if (core.fillDwordsFast(s, edi + 4 - span, count, s.regs[EAX])) {
+                    s.regs[EDI] = @truncate(edi -% span);
+                    s.regs[ECX] = 0;
+                    return;
+                }
+            }
+        }
         while (s.regs[ECX] != 0) {
             if (wide) memWrite32(s, s.regs[EDI], s.regs[EAX]) else memWrite16(s, s.regs[EDI], @truncate(s.regs[EAX]));
             s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + d);
@@ -2705,4 +2725,157 @@ test "unimplemented x87 state/BCD ops fault loudly instead of being silent NOPs"
         const s = runX87(c, 1.0, 2.0, &mem);
         try testing.expect(s.faulted and s.halted and s.unknown_opcode);
     }
+}
+
+// ─── rep stosd bulk fill: must match the per-element loop exactly ─────────────
+const DF_SET: u32 = 1 << DF_BIT;
+
+fn refRepStosd(s: *CpuState) void { // the original per-element behaviour
+    const d: i32 = if (getFlag(s, DF_BIT)) -4 else 4;
+    while (s.regs[ECX] != 0) {
+        memWrite32(s, s.regs[EDI], s.regs[EAX]);
+        s.regs[EDI] = @bitCast(@as(i32, @bitCast(s.regs[EDI])) + d);
+        s.regs[ECX] -%= 1;
+    }
+}
+
+fn stosState(mem: []u8, edi: u32, ecx: u32, eax: u32, df: bool) CpuState {
+    var s = CpuState{ .memory = mem.ptr, .memory_size = mem.len };
+    mem[0] = 0xF3; // rep
+    mem[1] = 0xAB; // stosd
+    s.regs[EDI] = edi;
+    s.regs[ECX] = ecx;
+    s.regs[EAX] = eax;
+    if (df) s.eflags |= DF_SET;
+    return s;
+}
+
+fn expectSameAsReference(size: usize, edi: u32, ecx: u32, eax: u32, df: bool, guard: bool) !void {
+    const mem_a = try std.heap.page_allocator.alloc(u8, size);
+    defer std.heap.page_allocator.free(mem_a);
+    const mem_b = try std.heap.page_allocator.alloc(u8, size);
+    defer std.heap.page_allocator.free(mem_b);
+    for (mem_a, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    @memcpy(mem_b, mem_a);
+    var a = CpuState{ .memory = mem_a.ptr, .memory_size = mem_a.len, .guard_null_page = guard };
+    var b = CpuState{ .memory = mem_b.ptr, .memory_size = mem_b.len, .guard_null_page = guard };
+    for ([_]*CpuState{ &a, &b }) |st| {
+        st.regs[EDI] = edi;
+        st.regs[ECX] = ecx;
+        st.regs[EAX] = eax;
+        if (df) st.eflags |= DF_SET;
+    }
+    a.rep_prefix = REP_REP;
+    opAB(&a); // handler under test (bulk path when possible); no code bytes in memory
+    refRepStosd(&b); // reference per-element loop
+    try testing.expectEqualSlices(u8, mem_b, mem_a);
+    try testing.expectEqual(b.regs[EDI], a.regs[EDI]);
+    try testing.expectEqual(b.regs[ECX], a.regs[ECX]);
+    try testing.expectEqual(b.faulted, a.faulted);
+    try testing.expectEqual(b.halted, a.halted);
+}
+
+test "rep stosd forward fill of a typical 17-dword debug frame" {
+    var mem = [_]u8{0} ** 512;
+    var s = stosState(&mem, 0x100, 17, 0xCCCCCCCC, false);
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x100 + 68), s.regs[EDI]);
+    try testing.expectEqual(@as(u32, 0), s.regs[ECX]);
+    try testing.expectEqual(@as(u32, 2), s.eip);
+    for (mem[0x100 .. 0x100 + 68]) |b| try testing.expectEqual(@as(u8, 0xCC), b);
+    try testing.expectEqual(@as(u8, 0), mem[0x100 - 1]);
+    try testing.expectEqual(@as(u8, 0), mem[0x100 + 68]);
+}
+
+test "rep stosd backward fill covers [edi-4*(n-1), edi+3]" {
+    var mem = [_]u8{0} ** 512;
+    var s = stosState(&mem, 0x100, 4, 0x01020304, true);
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x100 - 16), s.regs[EDI]);
+    try testing.expectEqual(@as(u32, 0), s.regs[ECX]);
+    try testing.expectEqual(@as(u8, 0x04), mem[0x100 - 12]); // lowest element written
+    try testing.expectEqual(@as(u8, 0x01), mem[0x100 + 3]); // highest byte of first element
+    try testing.expectEqual(@as(u8, 0), mem[0x100 - 13]);
+    try testing.expectEqual(@as(u8, 0), mem[0x100 + 4]);
+}
+
+test "rep stosd with ecx = 0 changes nothing" {
+    var mem = [_]u8{0x55} ** 64;
+    var s = stosState(&mem, 0x20, 0, 0xFFFFFFFF, false);
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x20), s.regs[EDI]);
+    try testing.expectEqual(@as(u8, 0x55), mem[0x20]);
+}
+
+test "rep stosd matches the per-element loop across sizes, offsets and directions" {
+    const sizes = [_]u32{ 0, 1, 2, 3, 16, 17, 21, 64, 100 };
+    for ([_]bool{ false, true }) |df| {
+        for (sizes) |n| {
+            var off: u32 = 0x40;
+            while (off < 0x48) : (off += 1) { // unaligned too
+                try expectSameAsReference(1024, off + 200, n, 0xCCCCCCCC, df, false);
+                try expectSameAsReference(1024, off, n, 0x12345678, df, false);
+            }
+        }
+    }
+}
+
+test "rep stosd running into the end of memory writes the fitting dwords then faults, like the loop" {
+    for ([_]u32{ 1000, 1004, 1008, 1012, 1013, 1020, 1021 }) |edi| {
+        for ([_]u32{ 1, 2, 3, 5 }) |n| {
+            try expectSameAsReference(1024, edi, n, 0xAABBCCDD, false, false);
+        }
+    }
+}
+
+test "rep stosd backward running below address 0 behaves like the loop" {
+    for ([_]u32{ 0, 3, 4, 7, 12 }) |edi| {
+        try expectSameAsReference(256, edi, 5, 0x0BADF00D, true, false);
+    }
+}
+
+test "rep stosd into the null page still faults when guarded" {
+    try expectSameAsReference(core.NULL_PAGE_SIZE + 256, 0x100, 8, 0xCCCCCCCC, false, true);
+    try expectSameAsReference(core.NULL_PAGE_SIZE + 256, core.NULL_PAGE_SIZE - 8, 8, 0xCCCCCCCC, false, true);
+}
+
+test "rep stosd across a watchpoint is reported, with the earlier dwords written" {
+    var mem_a = [_]u8{0} ** 512;
+    var a = stosState(&mem_a, 0x100, 8, 0x11223344, false);
+    a.watchpoint = 0x100 + 13; // inside the fourth dword
+    cpuStep(&a);
+    try testing.expect(a.watchpoint_hit);
+    try testing.expect(a.halted);
+    try testing.expectEqual(@as(u8, 0x44), mem_a[0x100]); // first dword written
+    try testing.expectEqual(@as(u8, 0x44), mem_a[0x100 + 8]); // third dword written
+}
+
+var stos_hook_calls: u32 = 0;
+fn stosHook(_: ?*anyopaque, _: u64, _: u64, _: u32, _: u8, _: u8) callconv(.c) void {
+    stos_hook_calls += 1;
+}
+
+test "rep stosd with a write hook still reports every changed byte" {
+    var mem = [_]u8{0} ** 256;
+    var s = stosState(&mem, 0x80, 4, 0x01010101, false);
+    s.write_hook = stosHook;
+    stos_hook_calls = 0;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 16), stos_hook_calls);
+}
+
+test "16-bit rep stos (0x66 prefix) keeps its word-sized behaviour" {
+    var mem = [_]u8{0} ** 64;
+    mem[0] = 0xF3;
+    mem[1] = 0x66;
+    mem[2] = 0xAB;
+    var s = CpuState{ .memory = &mem, .memory_size = mem.len };
+    s.regs[EDI] = 0x10;
+    s.regs[ECX] = 3;
+    s.regs[EAX] = 0xBEEF;
+    cpuStep(&s);
+    try testing.expectEqual(@as(u32, 0x16), s.regs[EDI]);
+    try testing.expectEqual(@as(u8, 0xEF), mem[0x10]);
+    try testing.expectEqual(@as(u8, 0xBE), mem[0x15]);
+    try testing.expectEqual(@as(u8, 0), mem[0x16]);
 }
